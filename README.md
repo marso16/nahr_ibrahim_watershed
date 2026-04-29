@@ -322,7 +322,7 @@ Physics-informed models detect a **48% steeper decline** under high emissions â€
 ```bash
 # Clone the repository
 git clone https://github.com/marso16/nahr_ibrahim_watershed.git
-cd nahr-ibrahim-ai-hydrology
+cd nahr_ibrahim_watershed
 
 # Create conda environment
 conda create -n thesis python=3.11 -y
