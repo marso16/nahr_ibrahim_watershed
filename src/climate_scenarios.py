@@ -48,10 +48,11 @@ for d in [SCEN_DIR, FIG_DIR, MET_DIR]:
 SCENARIOS    = ["ssp245", "ssp585"]
 LOOKBACK     = 30
 FEATURE_COLS = [
-    "precip_mm_day", "precip_3day",   "precip_7day",
-    "temp_mean_c",   "temp_max_c",    "temp_min_c",   "temp_range_c",
-    "swe_mm",        "swe_delta",     "snow_cover_pct",
-    "month_sin",     "month_cos",
+    "precip_mm_day", "precip_3day", "precip_7day",
+    "temp_mean_c", "temp_max_c", "temp_min_c",   
+    "temp_range_c", "swe_mm", "swe_delta",     
+    "snow_cover_pct", "month_sin", "month_cos",     
+    "soil_moisture_mm", "sm_7day_mean", "sm_anomaly",
 ]
 IDX_PRECIP = 0
 IDX_SWE    = 7

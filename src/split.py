@@ -79,9 +79,10 @@ print(f"\n  Fitting normalizer on training set only ...")
 # Features (inputs to be included in the model)
 feature_cols = [
     "precip_mm_day", "precip_3day", "precip_7day",
-    "temp_mean_c", "temp_max_c", "temp_min_c", "temp_range_c",
-    "swe_mm", "swe_delta", "snow_cover_pct",
-    "month_sin", "month_cos",
+    "temp_mean_c", "temp_max_c", "temp_min_c", 
+    "temp_range_c", "swe_mm", "swe_delta", 
+    "snow_cover_pct", "month_sin", "month_cos", 
+    "soil_moisture_mm", "sm_7day_mean", "sm_anomaly"
 ]
 
 target_col = "discharge_m3s" # using now glofas, to be replaced by gauged data if available later
