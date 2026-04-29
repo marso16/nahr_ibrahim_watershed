@@ -1,6 +1,6 @@
-# 🌊 AI Rainfall–Runoff Modeling — Nahr Ibrahim Watershed, Lebanon
+# AI Rainfall–Runoff Modeling — Nahr Ibrahim Watershed, Lebanon
 
-> **MSc Thesis** · Saint Joseph University Beirut (ESIB)  
+> **MSc In ai Thesis** · Saint Joseph University Beirut (ESIB)  
 > *Testing AI Models for Climate-Resilient Rainfall–Runoff Modeling in the Nahr Ibrahim Watershed*
 
 ---
