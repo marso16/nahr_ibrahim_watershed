@@ -35,9 +35,8 @@ print("  Giovanni vs Open-Meteo (ERA5)")
 print("=" * 65)
 
 # =============================================================================
-# 1. FETCH OPEN-METEO ERA5 DATA
+# FETCH OPEN-METEO ERA5 DATA
 # =============================================================================
-
 print("\n[1/4] Fetching Open-Meteo ERA5 reference data ...")
 
 def get_open_meteo(lat, lon, start, end):
@@ -78,7 +77,7 @@ print(f"\n  Sample:")
 print(ms_data.head(5).to_string())
 
 # =============================================================================
-# 2. LOAD GIOVANNI MASTER DATA
+# LOAD GIOVANNI MASTER DATA
 # =============================================================================
 
 print("\n[2/4] Loading Giovanni master dataset ...")
@@ -94,7 +93,7 @@ print(f"  Records : {len(master):,}")
 print(f"  Columns : {master.columns.tolist()}")
 
 # =============================================================================
-# 3. MERGE AND VALIDATE
+# MERGE AND VALIDATE
 # =============================================================================
 
 print("\n[3/4] Computing validation metrics ...")
@@ -109,11 +108,6 @@ merged = master.join(ms_data, how="inner").dropna(
 print(f"  Overlapping days: {len(merged):,}")
 
 def validate_pair(obs, pred, var_name, units):
-    """
-    Compare Giovanni (pred) against Open-Meteo ERA5 (obs).
-    Both are gridded area-estimates so comparison is fair.
-    """
-    # Remove any remaining NaN pairs
     mask = ~(np.isnan(obs) | np.isnan(pred))
     obs  = obs[mask]
     pred = pred[mask]
@@ -123,7 +117,6 @@ def validate_pair(obs, pred, var_name, units):
     rmse     = np.sqrt(np.mean((pred - obs)**2))
     mae      = np.mean(np.abs(pred - obs))
 
-    # PBIAS only meaningful for precipitation
     pbias = 100 * np.sum(pred - obs) / np.sum(obs) if np.sum(obs) > 0 else np.nan
 
     print(f"\n  {var_name} ({units})")
@@ -134,7 +127,6 @@ def validate_pair(obs, pred, var_name, units):
     if not np.isnan(pbias):
         print(f"    PBIAS       : {pbias:+.1f}%")
 
-    # Quality assessment
     if r >= 0.90:   quality = "Excellent"
     elif r >= 0.80: quality = "Good"
     elif r >= 0.70: quality = "Acceptable"
@@ -192,9 +184,8 @@ val_df.to_csv(MET_DIR / "data_validation_metrics.csv", index=False)
 print(f"\n  Metrics saved → results/metrics/data_validation_metrics.csv")
 
 # =============================================================================
-# 4. VISUALIZATION
+# VISUALIZATION
 # =============================================================================
-
 print("\n[4/4] Generating validation figures ...")
 
 fig = plt.figure(figsize=(20, 18))
@@ -213,58 +204,45 @@ for row, (label, obs, pred, r_val, color) in enumerate(pairs):
     # ── Scatter plot ──────────────────────────────────────
     ax_sc = fig.add_subplot(gs[row, 0])
     ax_sc.set_facecolor("#0d1825")
-    ax_sc.scatter(obs, pred, alpha=0.15, s=4,
-                  color=color, edgecolors="none")
+    ax_sc.scatter(obs, pred, alpha=0.15, s=4, color=color, edgecolors="none")
     lim = max(np.nanmax(obs), np.nanmax(pred)) * 1.05
     lo  = min(np.nanmin(obs), np.nanmin(pred)) - 0.5
-    ax_sc.plot([lo, lim], [lo, lim], color="#e76f51",
-               linewidth=1.5, linestyle="--", label="1:1 line")
+    ax_sc.plot([lo, lim], [lo, lim], color="#e76f51", linewidth=1.5, linestyle="--", label="1:1 line")
     ax_sc.set_xlabel("Open-Meteo ERA5", color="#8aafc4", fontsize=9)
     ax_sc.set_ylabel("Giovanni", color="#8aafc4", fontsize=9)
-    ax_sc.set_title(f"{label}\nr = {r_val:.3f}",
-                    color="#e8f4f8", fontsize=10)
+    ax_sc.set_title(f"{label}\nr = {r_val:.3f}", color="#e8f4f8", fontsize=10)
     ax_sc.tick_params(colors="#4a6a82", labelsize=8)
     ax_sc.spines[:].set_color("#1e3448")
-    ax_sc.legend(facecolor="#0d1825", edgecolor="#1e3448",
-                 labelcolor="#8aafc4", fontsize=7)
+    ax_sc.legend(facecolor="#0d1825", edgecolor="#1e3448", labelcolor="#8aafc4", fontsize=7)
     ax_sc.set_facecolor("#0d1825")
 
     # ── Time series (last 3 years) ────────────────────────
     ax_ts = fig.add_subplot(gs[row, 1:])
     ax_ts.set_facecolor("#0d1825")
-    dates = merged.index[-1096:]  # last 3 years
+    dates = merged.index[-1096:] 
     obs_r  = obs[-1096:]
     pred_r = pred[-1096:]
 
-    ax_ts.plot(dates, obs_r,  color="#8aafc4",  linewidth=0.8,
-               alpha=0.9, label="Open-Meteo ERA5")
-    ax_ts.plot(dates, pred_r, color=color,      linewidth=0.8,
-               alpha=0.9, linestyle="--", label="Giovanni")
-    ax_ts.set_title(f"{label} — 2023–2025 Comparison",
-                    color="#e8f4f8", fontsize=10)
-    ax_ts.set_ylabel(label.split("(")[1].replace(")", ""),
-                     color="#8aafc4", fontsize=9)
+    ax_ts.plot(dates, obs_r,  color="#8aafc4",  linewidth=0.8, alpha=0.9, label="Open-Meteo ERA5")
+    ax_ts.plot(dates, pred_r, color=color,      linewidth=0.8, alpha=0.9, linestyle="--", label="Giovanni")
+    ax_ts.set_title(f"{label} — 2023–2025 Comparison", color="#e8f4f8", fontsize=10)
+    ax_ts.set_ylabel(label.split("(")[1].replace(")", ""), color="#8aafc4", fontsize=9)
     ax_ts.tick_params(colors="#4a6a82", labelsize=8)
     ax_ts.spines[:].set_color("#1e3448")
-    ax_ts.legend(facecolor="#0d1825", edgecolor="#1e3448",
-                 labelcolor="#8aafc4", fontsize=7)
+    ax_ts.legend(facecolor="#0d1825", edgecolor="#1e3448", labelcolor="#8aafc4", fontsize=7)
     ax_ts.set_facecolor("#0d1825")
 
 fig.suptitle(
-    "Data Validation — Giovanni vs Open-Meteo ERA5\n"
-    "Nahr Ibrahim Watershed (34.09°N, 35.88°E)",
+    "Data Validation — Giovanni vs Open-Meteo ERA5",
     color="#e8f4f8", fontsize=14, y=1.01, fontfamily="monospace"
 )
 
-plt.savefig(FIG_DIR / "data_validation_giovanni_vs_openmeteo.png",
-            dpi=150, bbox_inches="tight", facecolor="#080f1a")
+plt.savefig(FIG_DIR / "data_validation_giovanni_vs_openmeteo.png", dpi=150, bbox_inches="tight", facecolor="#080f1a")
 plt.show()
-print("  ✓ Figure saved → results/figures/data_validation_giovanni_vs_openmeteo.png")
 
 # =============================================================================
-# 5. SUMMARY
+# SUMMARY
 # =============================================================================
-
 print("\n" + "=" * 65)
 print("  VALIDATION SUMMARY")
 print("=" * 65)
@@ -285,5 +263,4 @@ print(f"  satellite correction vs ERA5 model simulation.")
 print(f"\n  Files saved:")
 print(f"    results/metrics/data_validation_metrics.csv")
 print(f"    results/figures/data_validation_giovanni_vs_openmeteo.png")
-print(f"\n  ✅ Data validation complete.")
 print("=" * 65)

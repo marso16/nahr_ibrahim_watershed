@@ -1,4 +1,3 @@
-import os
 import re
 import sys
 import io
@@ -21,9 +20,6 @@ from tqdm import tqdm
 
 logging.getLogger("cfgrib").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore")
-os.environ["CPL_LOG"] = "NUL"
-os.environ["ECCODES_LOG_STREAM"] = "NUL"
-
 
 # =============================================================================
 # PATHS

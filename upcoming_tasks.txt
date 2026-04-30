@@ -1,0 +1,4 @@
+graphical methodology
+precip data, stream satellite data (discharge)
+projection of data
+different scenarios (low, medium, high)

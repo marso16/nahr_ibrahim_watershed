@@ -107,7 +107,6 @@ nahr_ibrahim_watershed/
 │       ├── lstm.py            # LSTM v1 baseline
 │       ├── cnn_lstm.py        # CNN-LSTM hybrid
 │       ├── transformer.py     # Transformer encoder
-│       ├── tft.py             # Temporal Fusion Transformer
 │       └── pi_models.py       # PI-LSTM and PI-Transformer (hybrid)
 │
 ├── app.py                     # Streamlit dashboard
@@ -176,7 +175,6 @@ python src/windowing.py
 python src/models/lstm.py
 python src/models/cnn_lstm.py
 python src/models/transformer.py
-python src/models/tft.py
 python src/models/pi_models.py   # trains PI-LSTM and PI-Transformer
 
 # 6. Run climate scenario projections
@@ -229,7 +227,6 @@ Input shape: `(samples, 30, 12)` — 30-day lookback, 1-day ahead prediction.
 | **LSTM** | 2-layer stacked LSTM (128→64) + Dense(32) | 123,713 | ~15 min |
 | **CNN-LSTM** | Conv1D(64,32) + LSTM(128,64) + Dense(32) | 142,497 | ~7 min |
 | **Transformer** | 3-block encoder, d=64, 4 heads, FFN=128 | ~108,000 | ~11 min |
-| **TFT** | VSN + GRN + LSTM encoder + interpretable attention | 299,773 | ~15 min |
 
 ### Physics-Informed Hybrid Models
 
@@ -259,12 +256,10 @@ Where `λ = 0.05`, ET computed via Hamon (1961) PET method.
 | 3 | PI-Transformer | Hybrid | 0.528 | **0.660** | **−37.8%** | +4.1% |
 | 4 | LSTM | Pure AI | 0.518 | 0.503 | −43.3% | +3.8% |
 | 5 | PI-LSTM | Hybrid | 0.512 | 0.486 | −47.2% | +2.6% |
-| 6 | TFT | Pure AI | 0.131 | 0.181 | −69.1% | — |
 
 > **Key findings:**
 > - Transformer achieves best NSE (0.603) and lowest RMSE
 > - PI-Transformer achieves best KGE (0.660) and best Peak Bias (−37.8%)
-> - TFT failed to converge (best epoch = 3) — insufficient training data for variable selection networks
 > - All models show systematic peak flow underestimation attributable to GloFAS target smoothing
 
 ---
@@ -410,13 +405,10 @@ streamlit run app.py
 **1. GloFAS discharge ceiling**
 All models are trained on GloFAS-ERA5 reanalysis discharge rather than real in-situ gauge data. This introduces a systematic performance ceiling (NSE ~0.60 vs ~0.80+ with real gauge data) due to GloFAS smoothing of karstic spring pulses. Real discharge data for Nahr Ibrahim is held by DGHER (Lebanese Ministry of Energy and Water).
 
-**2. TFT convergence**
-The Temporal Fusion Transformer failed to converge on the 6,545-sample training set (best epoch = 3, NSE = 0.131), consistent with the known data requirements of variable selection networks. TFT is excluded from the climate scenario ensemble.
-
-**3. Single GCM**
+**2. Single GCM**
 Climate projections use only MPI-ESM1-2-HR. Multi-model ensemble analysis with additional CMIP6 models would provide uncertainty bounds on projected discharge trends.
 
-**4. Single watershed**
+**3. Single watershed**
 Results are specific to Nahr Ibrahim. Transfer to other Lebanese or Eastern Mediterranean watersheds requires retraining or transfer learning.
 
 ---

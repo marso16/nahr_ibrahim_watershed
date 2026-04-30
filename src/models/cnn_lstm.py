@@ -28,7 +28,7 @@ for d in [MODEL_DIR / "trained", MODEL_DIR / "checkpoints",
 CFG = {
     "model_name"    : "CNN_LSTM",
     "lookback"      : 30,
-    "n_features"    : 15,
+    "n_features"    : 16,
     # CNN
     "cnn_filters"   : [64, 32],    # filters per conv layer
     "kernel_size"   : 3,           # 3-day local pattern window
@@ -523,5 +523,4 @@ print(f"    models/checkpoints/cnn_lstm_best.keras")
 print(f"    results/metrics/cnn_lstm_metrics.csv")
 print(f"    results/predictions/cnn_lstm_predictions_*.csv")
 print(f"    results/figures/cnn_lstm_results.png")
-print(f"\n  ✅ CNN-LSTM complete. Next: TFT model.")
 print("=" * 65)

@@ -28,7 +28,7 @@ for d in [MODEL_DIR / "trained", MODEL_DIR / "checkpoints",
 CFG = {
     "model_name"    : "LSTM",
     "lookback"      : 30,
-    "n_features"    : 15,
+    "n_features"    : 16,
     "lstm_units"    : [128, 64],
     "dense_units"   : [32],
     "dropout"       : 0.3,

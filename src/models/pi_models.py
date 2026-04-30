@@ -34,10 +34,12 @@ LAMBDA_WB = 0.05
 # Feature column indices in the sequence array
 # Must match FEATURE_COLS in split.py exactly
 FEATURE_COLS = [
-    "precip_mm_day", "precip_3day", "precip_7day",       # indices 0,1,2
-    "temp_mean_c",   "temp_max_c",  "temp_min_c",         # indices 3,4,5
-    "temp_range_c",  "swe_mm",      "swe_delta",           # indices 6,7,8
-    "snow_cover_pct","month_sin",   "month_cos",           # indices 9,10,11
+    "precip_mm_day", "precip_3day",    "precip_7day",     # indices 0,1,2
+    "temp_mean_c",   "temp_max_c",     "temp_min_c",      # indices 3,4,5
+    "temp_range_c",  "swe_mm",         "swe_delta",       # indices 6,7,8
+    "snow_cover_pct","month_sin",      "month_cos",       # indices 9,10,11
+    "soil_moisture_mm","sm_7day_mean", "sm_anomaly",      # indices 12,13,14
+    "pet_mm_day",                                         # index 15
 ]
 
 # Indices used in water balance computation
@@ -580,8 +582,8 @@ print(f"  Saved → models/trained/pi_transformer_final.keras")
 print("\n[6/7] Evaluating ...")
 
 # Pure AI baselines for comparison
-PURE_LSTM        = {"NSE":0.518,"KGE":0.503,"Peak_Bias_%":-43.3,"PBIAS_%":-5.0}
-PURE_TRANSFORMER = {"NSE":0.603,"KGE":0.632,"Peak_Bias_%":-41.2,"PBIAS_%":-3.6}
+PURE_LSTM        = {"NSE":0.515,"KGE":0.423,"Peak_Bias_%":-51.7,"PBIAS_%":0.0}
+PURE_TRANSFORMER = {"NSE":0.680,"KGE":0.671,"Peak_Bias_%":-37.0,"PBIAS_%":2.3}
 
 all_metrics = []
 
@@ -634,8 +636,8 @@ metrics_df.to_csv(MET_DIR / "pi_models_metrics.csv", index=False)
 print(f"\n  {'Model':<18} {'NSE':>8} {'KGE':>8} "
       f"{'Peak Bias':>11} {'PBIAS':>8}")
 print(f"  {'-'*58}")
-for name, base in [("LSTM (pure)",        PURE_LSTM),
-                   ("Transformer (pure)",  PURE_TRANSFORMER)]:
+for name, base in [("LSTM",        PURE_LSTM),
+                   ("Transformer",  PURE_TRANSFORMER)]:
     print(f"  {name:<18} {base['NSE']:>8.4f} {base['KGE']:>8.4f} "
           f"{base['Peak_Bias_%']:>11.2f}% {base['PBIAS_%']:>7.2f}%")
 
@@ -732,17 +734,16 @@ ax2 = fig.add_subplot(gs[2, :2])
 ax2.set_facecolor("#0d1825")
 metric_names = ["NSE", "KGE", "Log_NSE"]
 models_cmp   = [
-    ("LSTM (pure)",        [PURE_LSTM["NSE"],       PURE_LSTM["KGE"],       0.633], "#4a6a82"),
+    ("LSTM",        [PURE_LSTM["NSE"],       PURE_LSTM["KGE"],       0.633], "#4a6a82"),
     ("PI-LSTM",            [m["NSE"] for m in all_metrics if m["model"]=="PI-LSTM"][0:1]*3,
                            "#3b9eff"),
-    ("Transformer (pure)", [PURE_TRANSFORMER["NSE"],PURE_TRANSFORMER["KGE"],0.671], "#555555"),
+    ("Transformer", [PURE_TRANSFORMER["NSE"],PURE_TRANSFORMER["KGE"],0.671], "#555555"),
     ("PI-Transformer",     [m["NSE"] for m in all_metrics if m["model"]=="PI-Transformer"][0:1]*3,
                            "#a855f7"),
 ]
 
-# Fix: extract properly
 models_cmp = [
-    ("LSTM (pure)",        [PURE_LSTM["NSE"], PURE_LSTM["KGE"], 0.633],        "#4a6a82"),
+    ("LSTM",        [PURE_LSTM["NSE"], PURE_LSTM["KGE"], 0.633],        "#4a6a82"),
     ("PI-LSTM",            [next(m["NSE"] for m in all_metrics if m["model"]=="PI-LSTM"),
                             next(m["KGE"] for m in all_metrics if m["model"]=="PI-LSTM"),
                             next(m["Log_NSE"] for m in all_metrics if m["model"]=="PI-LSTM")],
@@ -827,8 +828,8 @@ print(f"\n  {'Model':<20} {'NSE':>8} {'KGE':>8} "
 print(f"  {'-'*67}")
 
 baselines = [
-    ("LSTM (pure)",        0.518, 0.503, 0.292, -43.3, -5.0),
-    ("Transformer (pure)", 0.603, 0.632, 0.268, -41.2, -3.6),
+    ("LSTM",        0.518, 0.503, 0.292, -43.3, -5.0),
+    ("Transformer", 0.603, 0.632, 0.268, -41.2, -3.6),
 ]
 for name, nse, kge, rmse, pb, pbias in baselines:
     print(f"  {name:<20} {nse:>8.4f} {kge:>8.4f} "
@@ -845,6 +846,4 @@ print(f"    models/trained/pi_lstm_final.keras")
 print(f"    models/trained/pi_transformer_final.keras")
 print(f"    results/metrics/pi_models_metrics.csv")
 print(f"    results/figures/pi_models_results.png")
-print(f"\n  ✅ Physics-informed models complete.")
-print(f"     Next: rerun climate_scenarios.py to include PI models.")
 print("=" * 65)

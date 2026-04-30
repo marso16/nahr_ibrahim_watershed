@@ -407,7 +407,7 @@ if page == "🌊 Overview":
         <br>
         <div class='hero-tags'>
             <span class='hero-tag'>Nahr Ibrahim Watershed</span>
-            <span class='hero-tag'>LSTM · Transformer · CNN-LSTM · TFT</span>
+            <span class='hero-tag'>LSTM · Transformer · CNN-LSTM</span>
             <span class='hero-tag'>GPM IMERG · MERRA-2 · GloFAS · MODIS</span>
             <span class='hero-tag'>SSP2-4.5 · SSP5-8.5</span>
         </div>
@@ -929,7 +929,7 @@ elif page == "📋 Pipeline Summary":
         ("✅", "Feature Engineering", "Derived: precip_3day, precip_7day (rolling sums), temp_range_c, swe_delta (snowmelt proxy), month_sin/cos (cyclical encoding), season labels."),
         ("✅", "Train/Val/Test Split", "Chronological split: Train 2000–2017 (6,575 days), Val 2018–2020 (1,096), Test 2021–2025 (1,826). Min-max normalization fitted on train only. Scaler params saved for inverse transform."),
         ("🔜", "Sequence Windowing", "Create sliding window sequences (lookback=30 days) for LSTM/Transformer input. Shape: (samples, timesteps, features)."),
-        ("🔜", "Model Training", "Train LSTM, Transformer, CNN-LSTM, TFT on training set. Early stopping on validation NSE."),
+        ("🔜", "Model Training", "Train LSTM, Transformer, CNN-LSTM on training set. Early stopping on validation NSE."),
         ("🔜", "Evaluation", "Nash-Sutcliffe Efficiency, KGE, RMSE, peak flow bias on test set. Sensitivity analysis. Robustness under projected scenarios."),
         ("🔜", "Climate Scenarios", "Apply trained models to NEX-GDDP-CMIP6 projections (SSP2-4.5, SSP5-8.5) for 2015–2100."),
     ]

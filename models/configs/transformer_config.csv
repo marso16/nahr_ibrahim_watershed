@@ -1,0 +1,2 @@
+model_name,lookback,n_features,d_model,n_heads,n_encoder_blocks,ffn_dim,dropout,dense_units,learning_rate,warmup_epochs,batch_size,epochs,patience,min_delta,peak_weight,peak_threshold,log_transform,seed
+Transformer,30,16,64,4,3,128,0.2,"[64, 32]",0.001,10,32,300,40,1e-06,3.0,0.75,True,42

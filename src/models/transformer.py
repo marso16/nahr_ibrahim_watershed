@@ -45,7 +45,7 @@ for d in [MODEL_DIR / "trained", MODEL_DIR / "checkpoints",
 CFG = {
     "model_name"      : "Transformer",
     "lookback"        : 30,
-    "n_features"      : 15,
+    "n_features"      : 16,
     # Transformer-specific
     "d_model"         : 64,      # embedding dimension (must be divisible by n_heads)
     "n_heads"         : 4,       # number of attention heads
@@ -693,5 +693,4 @@ print(f"    models/checkpoints/transformer_best.keras")
 print(f"    results/metrics/transformer_metrics.csv")
 print(f"    results/predictions/transformer_predictions_*.csv")
 print(f"    results/figures/transformer_results.png")
-print(f"\n  ✅ Transformer complete. Next: CNN-LSTM model.")
 print("=" * 65)

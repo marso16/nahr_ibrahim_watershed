@@ -1,0 +1,2 @@
+model_name,lookback,n_features,cnn_filters,kernel_size,cnn_dropout,lstm_units,lstm_dropout,recurrent_drop,dense_units,dense_dropout,learning_rate,batch_size,epochs,patience,min_delta,seed
+CNN_LSTM,30,16,"[64, 32]",3,0.2,"[128, 64]",0.2,0.0,[32],0.1,0.001,32,150,20,1e-05,42

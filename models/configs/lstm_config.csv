@@ -1,0 +1,2 @@
+model_name,lookback,n_features,lstm_units,dense_units,dropout,recurrent_drop,learning_rate,batch_size,epochs,patience,min_delta,seed
+LSTM,30,16,"[128, 64]",[32],0.3,0.2,0.001,32,150,20,1e-05,42
