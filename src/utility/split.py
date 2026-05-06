@@ -77,17 +77,13 @@ for col in check_cols:
 # FEATURE COLUMNS — 16 total
 # =============================================================================
 FEATURE_COLS = [
-    "precip_mm_day", "temp_min_c", "temp_max_c",
-    "swe_mm", "snow_cover_pct", "soil_moisture_mm", "pet_mm_day",
+    "precip_mm_day", "precip_3day",    "precip_7day",     # indices 0,1,2
+    "temp_mean_c",   "temp_max_c",     "temp_min_c",      # indices 3,4,5
+    "temp_range_c",  "swe_mm",         "swe_delta",       # indices 6,7,8
+    "snow_cover_pct","month_sin",      "month_cos",       # indices 9,10,11
+    "soil_moisture_mm","sm_7day_mean", "sm_anomaly",      # indices 12,13,14
+    "pet_mm_day",                                         # index 15
 ]
-# FEATURE_COLS = [
-#     "precip_mm_day", "precip_3day",    "precip_7day",
-#     "temp_mean_c",   "temp_max_c",     "temp_min_c",   "temp_range_c",
-#     "swe_mm",        "swe_delta",      "snow_cover_pct",
-#     "month_sin",     "month_cos",
-#     "soil_moisture_mm", "sm_7day_mean", "sm_anomaly",
-#     "pet_mm_day",
-# ]
 target_col = "discharge_m3s"
 
 print(f"\n  Feature columns ({len(FEATURE_COLS)}):")

@@ -31,8 +31,6 @@ for d in [MODEL_DIR/"trained", MODEL_DIR/"checkpoints",
 # 0.05 = 5% penalty — conservative and stable
 LAMBDA_WB = 0.05
 
-# Feature column indices in the sequence array
-# Must match FEATURE_COLS in split.py exactly
 FEATURE_COLS = [
     "precip_mm_day", "precip_3day",    "precip_7day",     # indices 0,1,2
     "temp_mean_c",   "temp_max_c",     "temp_min_c",      # indices 3,4,5

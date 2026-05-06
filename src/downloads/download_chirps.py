@@ -7,7 +7,12 @@ ee.Initialize(project='final-project-490411')
 OUTPUT = Path(r"data\raw\chirps")
 OUTPUT.mkdir(parents=True, exist_ok=True)
 
-geometry = ee.Geometry.Rectangle([35.80, 34.00, 36.00, 34.15])
+geometry = ee.Geometry.Rectangle([35.84, 34.02, 35.96, 34.16])
+
+NORTH = 34.16
+SOUTH = 34.02
+WEST  = 35.84
+EAST  = 35.96
 
 all_records = []
 
