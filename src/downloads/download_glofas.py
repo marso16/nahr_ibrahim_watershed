@@ -10,12 +10,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==================================================
 DATASET = "cems-glofas-historical" 
 OUTPUT_DIR = r"data\raw\glofas"
-STATE_FILE = "download_state.json"
-
-YEARS = list(range(2000, 2026))
+STATE_FILE = r"C:\Users\marck\Downloads\nahr_ibrahim_watershed\download_state.json"
+YEARS = range(2000, 2026)
 MONTHS = list(range(1, 13))
 
-MAX_WORKERS = 4
+MAX_WORKERS = 1
 MAX_RETRIES = 6
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
