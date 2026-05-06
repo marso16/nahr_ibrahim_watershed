@@ -14,7 +14,7 @@ STATE_FILE = r"C:\Users\marck\Downloads\nahr_ibrahim_watershed\download_state.js
 YEARS = range(2000, 2026)
 MONTHS = list(range(1, 13))
 
-MAX_WORKERS = 1
+MAX_WORKERS = 4
 MAX_RETRIES = 6
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
