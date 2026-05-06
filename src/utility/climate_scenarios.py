@@ -212,36 +212,51 @@ if not models:
 
 def load_cmip6_scenario(scenario: str) -> pd.DataFrame:
     print(f"\n  Loading CMIP6 {scenario.upper()} ...")
-    nc_dir = CMIP6_DIR / scenario / "pr"
-    years  = sorted([int(f.stem) for f in nc_dir.glob("*.nc")])
+    csv_dir = CMIP6_DIR / scenario / "pr"
+    years   = sorted([int(f.stem) for f in csv_dir.glob("*.csv")])
     print(f"  Years: {years[0]}–{years[-1]} ({len(years)} files)")
+
+    # Unit conversion factors
+    # pr  : kg/m²/s → mm/day (*86400)
+    # tas : K → °C (-273.15)
+    # tasmin/tasmax : K → °C (-273.15)
+    UNIT_CONV = {
+        "pr"    : lambda x: x * 86400,
+        "tas"   : lambda x: x - 273.15,
+        "tasmin": lambda x: x - 273.15,
+        "tasmax": lambda x: x - 273.15,
+    }
 
     records = []
     for year in years:
         try:
-            pr_ds  = xr.open_dataset(CMIP6_DIR / scenario / "pr"     / f"{year}.nc")
-            tas_ds = xr.open_dataset(CMIP6_DIR / scenario / "tas"    / f"{year}.nc")
-            tn_ds  = xr.open_dataset(CMIP6_DIR / scenario / "tasmin" / f"{year}.nc")
-            tx_path = CMIP6_DIR / scenario / "tasmax" / f"{year}.nc"
-            tx_ds   = xr.open_dataset(tx_path) if tx_path.exists() else None
+            # Load all 4 variables for this year
+            dfs = {}
+            for var in ["pr", "tas", "tasmin", "tasmax"]:
+                fpath = CMIP6_DIR / scenario / var / f"{year}.csv"
+                if not fpath.exists():
+                    raise FileNotFoundError(f"{var}/{year}.csv not found")
+                df_v = pd.read_csv(fpath, parse_dates=["date"])
+                df_v["value"] = pd.to_numeric(
+                    df_v["value"], errors="coerce"
+                )
+                # Apply unit conversion
+                df_v["value"] = UNIT_CONV[var](df_v["value"])
+                dfs[var] = df_v.set_index("date")["value"]
 
-            times = pd.to_datetime(pr_ds["time"].values)
-            pr_v  = pr_ds["pr"].mean(dim=["lat","lon"]).values * 86400
-            tas_v = tas_ds["tas"].mean(dim=["lat","lon"]).values - 273.15
-            tn_v  = tn_ds["tasmin"].mean(dim=["lat","lon"]).values - 273.15
-            tx_v  = (tx_ds["tasmax"].mean(dim=["lat","lon"]).values - 273.15
-                     if tx_ds is not None else tas_v + 5.0)
+            # Align on common dates
+            merged = pd.DataFrame(dfs)
+            merged.columns = ["pr", "tas", "tasmin", "tasmax"]
+            merged = merged.dropna()
 
-            for i, t in enumerate(times):
+            for date, row in merged.iterrows():
                 records.append({
-                    "date"       : t,
-                    "pr_raw"     : max(0.0, float(pr_v[i])),
-                    "tas_raw"    : float(tas_v[i]),
-                    "tasmin_raw" : float(tn_v[i]),
-                    "tasmax_raw" : float(tx_v[i]),
+                    "date"       : date,
+                    "pr_raw"     : max(0.0, float(row["pr"])),
+                    "tas_raw"    : float(row["tas"]),
+                    "tasmin_raw" : float(row["tasmin"]),
+                    "tasmax_raw" : float(row["tasmax"]),
                 })
-            pr_ds.close(); tas_ds.close(); tn_ds.close()
-            if tx_ds is not None: tx_ds.close()
 
         except Exception as e:
             print(f"    WARNING: {year} — {e}")

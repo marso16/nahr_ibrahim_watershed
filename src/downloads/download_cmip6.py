@@ -1,6 +1,8 @@
-import requests
-import xarray as xr
+import ee
+import pandas as pd
 from pathlib import Path
+
+ee.Initialize(project='final-project-490411')
 
 # =============================================================================
 # CONFIGURATION
@@ -10,123 +12,108 @@ SOUTH = 34.02
 WEST  = 35.84
 EAST  = 35.96
 
-MODEL    = "MPI-ESM1-2-HR"
-REALIZ   = "r1i1p1f1"
-VERSION  = "v2.0"
-
+MODEL     = "MPI-ESM1-2-HR"
 SCENARIOS = ["ssp245", "ssp585"]
-VARIABLES = ["pr", "tas", "tasmin", "tasmax"]  
+VARIABLES = ["pr", "tas", "tasmin", "tasmax"]
 YEARS     = range(2015, 2101)
 
-BASE_URL   = "https://ds.nccs.nasa.gov/thredds/ncss/grid/AMES/NEX/GDDP-CMIP6"
 OUTPUT_DIR = Path(r"data\raw\cmip6")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# =============================================================================
-# BUILD THREDDS SUBSET URL
-# =============================================================================
-def build_url(scenario: str, variable: str, year: int) -> str:
-    filename = (f"{variable}_day_{MODEL}_{scenario}_"
-                f"{REALIZ}_gn_{year}_{VERSION}.nc")
-    base = (f"{BASE_URL}/{MODEL}/{scenario}/"
-            f"{REALIZ}/{variable}/{filename}")
-    params = (f"?var={variable}"
-              f"&north={NORTH}&south={SOUTH}"
-              f"&west={WEST}&east={EAST}"
-              f"&horizStride=1"
-              f"&time_start={year}-01-01T00:00:00Z"
-              f"&time_end={year}-12-31T23:59:59Z"
-              f"&accept=netcdf4"
-              f"&addLatLon=true")
-    return base + params
+geometry = ee.Geometry.Rectangle([WEST, SOUTH, EAST, NORTH])
 
-# =============================================================================
-# DOWNLOAD ONE FILE
-# =============================================================================
-def download_subset(scenario: str, variable: str, year: int) -> str:
-    out_path = OUTPUT_DIR / scenario / variable / f"{year}.nc"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if out_path.exists():
-        return "skipped"
-
-    url = build_url(scenario, variable, year)
-
-    try:
-        response = requests.get(url, timeout=120)
-        response.raise_for_status()
-
-        with open(out_path, "wb") as f:
-            f.write(response.content)
-
-        size_kb = len(response.content) / 1024
-        return f"ok ({size_kb:.0f} KB)"
-
-    except Exception as e:
-        return f"failed: {e}"
-
-# =============================================================================
-# VERIFY ONE FILE BEFORE FULL DOWNLOAD
-# =============================================================================
 print("=" * 55)
-print("  Nahr Ibrahim — CMIP6 Download (THREDDS Subsetting)")
+print("  Nahr Ibrahim — CMIP6 Download (Google Earth Engine)")
 print("=" * 55)
 print(f"\n  Model    : {MODEL}")
 print(f"  Scenarios: {', '.join(SCENARIOS)}")
 print(f"  Variables: {', '.join(VARIABLES)}")
 print(f"  Period   : {min(YEARS)}–{max(YEARS)}")
 print(f"  Bbox     : {SOUTH}–{NORTH}°N, {WEST}–{EAST}°E")
-print(f"  Output   : {OUTPUT_DIR}")
-
-print("\n  Running test download (ssp245/pr/2015) ...")
-test_result = download_subset("ssp245", "pr", 2015)
-print(f"  Test result: {test_result}")
-
-if test_result.startswith("ok") or test_result == "skipped":
-    test_path = OUTPUT_DIR / "ssp245" / "pr" / "2015.nc"
-    if test_path.exists():
-        ds = xr.open_dataset(test_path)
-        print(f"  Variables : {list(ds.data_vars)}")
-        print(f"  Lat range : {ds.lat.values}")
-        print(f"  Lon range : {ds.lon.values}")
-        print(f"  Time steps: {len(ds.time)} days")
-        ds.close()
-    print("\n    Test passed — starting full download ...\n")
-else:
-    print(f"\n    Test failed: {test_result}")
-    print("  Check your internet connection and try again.")
-    exit(1)
+print(f"  Output   : {OUTPUT_DIR}\n")
 
 # =============================================================================
-# FULL DOWNLOAD LOOP
+# GEE BAND NAME MAP
+# =============================================================================
+# GEE uses same names: pr, tas, tasmin, tasmax — confirmed from band check
+BAND_MAP = {
+    "pr"    : "pr",
+    "tas"   : "tas",
+    "tasmin": "tasmin",
+    "tasmax": "tasmax",
+}
+
+# =============================================================================
+# DOWNLOAD LOOP
 # =============================================================================
 total   = len(SCENARIOS) * len(VARIABLES) * len(YEARS)
 count   = 0
 results = {"ok": 0, "skipped": 0, "failed": 0}
-failed_files = []
-
-print(f"  Total files : {total}")
-print(f"  Est. size   : ~{total * 36 / 1024:.0f} MB")
-print(f"  Est. time   : ~{total * 30 / 3600:.1f} hours\n")
+failed  = []
 
 for scenario in SCENARIOS:
     for variable in VARIABLES:
+        band = BAND_MAP[variable]
+        out_dir = OUTPUT_DIR / scenario / variable
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         for year in YEARS:
             count += 1
-            result = download_subset(scenario, variable, year)
+            out_file = out_dir / f"{year}.csv"
 
-            if result.startswith("ok"):
-                results["ok"] += 1
-            elif result == "skipped":
+            if out_file.exists():
+                print(f"[{count:>4}/{total}] {scenario}/{variable}/{year} → skipped")
                 results["skipped"] += 1
-            else:
-                results["failed"] += 1
-                failed_files.append(f"{scenario}/{variable}/{year}")
+                continue
 
-            print(f"[{count:>4}/{total}] {scenario}/{variable}/{year} → {result}")
+            try:
+                collection = (
+                    ee.ImageCollection("NASA/GDDP-CMIP6")
+                    .filter(ee.Filter.eq("model", MODEL))
+                    .filter(ee.Filter.eq("scenario", scenario))
+                    .filterDate(f"{year}-01-01", f"{year}-12-31")
+                    .select(band)
+                )
+
+                def extract(image):
+                    mean = image.reduceRegion(
+                        reducer  = ee.Reducer.mean(),
+                        geometry = geometry,
+                        scale    = 25000,
+                        maxPixels= 1e9
+                    )
+                    return ee.Feature(None, {
+                        "date" : image.date().format("YYYY-MM-dd"),
+                        "value": mean.get(band)
+                    })
+
+                fc   = ee.FeatureCollection(collection.map(extract))
+                data = fc.getInfo()
+
+                records = []
+                for f in data["features"]:
+                    records.append({
+                        "date" : f["properties"]["date"],
+                        "value": f["properties"]["value"]
+                    })
+
+                df = pd.DataFrame(records)
+                df["date"]  = pd.to_datetime(df["date"])
+                df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                df = df.sort_values("date").reset_index(drop=True)
+                df.to_csv(out_file, index=False)
+
+                print(f"[{count:>4}/{total}] {scenario}/{variable}/{year} → "
+                      f"ok ({len(df)} days | mean={df['value'].mean():.8f})")
+                results["ok"] += 1
+
+            except Exception as e:
+                print(f"[{count:>4}/{total}] {scenario}/{variable}/{year} → FAILED — {e}")
+                results["failed"] += 1
+                failed.append(f"{scenario}/{variable}/{year}")
 
 # =============================================================================
-# FINAL SUMMARY
+# SUMMARY
 # =============================================================================
 print(f"\n{'='*55}")
 print(f"  DOWNLOAD COMPLETE")
@@ -135,37 +122,30 @@ print(f"  Downloaded : {results['ok']}")
 print(f"  Skipped    : {results['skipped']} (already existed)")
 print(f"  Failed     : {results['failed']}")
 
-if failed_files:
-    print(f"\n  Failed files ({len(failed_files)}):")
-    for f in failed_files[:10]:
+if failed:
+    print(f"\n  Failed files ({len(failed)}):")
+    for f in failed[:10]:
         print(f"    {f}")
-    if len(failed_files) > 10:
-        print(f"    ... and {len(failed_files)-10} more")
-    print(f"\n  To retry failed files, simply rerun this script.")
-    print(f"  Already downloaded files will be skipped automatically.")
+    if len(failed) > 10:
+        print(f"    ... and {len(failed)-10} more")
+    print(f"\n  Rerun to retry failed files automatically.")
 
-# =============================================================================
-# VERIFY COMPLETE DOWNLOAD
-# =============================================================================
-print(f"\n  Verifying download completeness ...")
+print(f"\n  Verifying completeness ...")
 print(f"  {'Scenario':<10} {'Variable':<10} {'Files':>8} {'Expected':>10} {'Status':>10}")
 print(f"  {'-'*52}")
-
-expected = len(YEARS)
+expected    = len(YEARS)
 all_complete = True
-
 for scenario in SCENARIOS:
     for variable in VARIABLES:
         folder = OUTPUT_DIR / scenario / variable
-        found  = len(list(folder.glob("*.nc"))) if folder.exists() else 0
-        status = " Complete" if found == expected else f"  {found}/{expected}"
+        found  = len(list(folder.glob("*.csv"))) if folder.exists() else 0
+        status = "Complete" if found == expected else f"{found}/{expected}"
         if found != expected:
             all_complete = False
         print(f"  {scenario:<10} {variable:<10} {found:>8} {expected:>10} {status:>10}")
 
 if all_complete:
-    print(f"\n   All files downloaded successfully.")
-    print(f"     Ready to run: python src/climate_scenarios.py")
+    print(f"\n  All files downloaded.")
 else:
-    print(f"\n   Some files missing. Rerun this script to retry.")
+    print(f"\n  Some files missing. Rerun to retry.")
 print(f"{'='*55}")

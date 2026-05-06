@@ -53,7 +53,7 @@ def build_request(year, month):
         "hmonth": [f"{month:02d}"],
         "hday": [f"{d:02d}" for d in range(1, 32)],
         "download_format": "zip",
-        "area": [34.2120, 33.9929, 35.6429, 36.0487],
+        "area": [34.16, 35.84, 34.02, 35.96],
     }
 
 # ==================================================
