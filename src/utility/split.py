@@ -1,194 +1,179 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 from pathlib import Path
 
-# =============================================================================
-# PATHS
-# =============================================================================
-ROOT       = Path("C:/Users/marck/Downloads/nahr_ibrahim_watershed")
-MASTER_DIR = ROOT / "data" / "master"
-SPLIT_DIR  = ROOT / "data" / "splits"
-FIG_DIR    = ROOT / "results" / "figures"
+# ── Paths ──────────────────────────────────────────────────────────────────────
+ROOT = Path("C:/Users/marck/Downloads/nahr_ibrahim_watershed")
+MASTER = ROOT / "data" / "master"
+SPLIT_DIR = ROOT / "data" / "splits"
+FIG_DIR = ROOT / "results" / "figures"
 
 SPLIT_DIR.mkdir(parents=True, exist_ok=True)
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-# =============================================================================
-# LOAD MASTER DATASET
-# =============================================================================
-df = pd.read_csv(
-    MASTER_DIR / "nahr_ibrahim_master_model.csv",
-    parse_dates=["date"]
-)
+# ── Load master dataset ────────────────────────────────────────────────────────
+# We use the model version (rows with valid discharge) rather than the full
+# dataset so the split sizes reflect actual usable training samples.
+df = pd.read_csv(MASTER / "nahr_ibrahim_master_model.csv", parse_dates=["date"])
 df = df.sort_values("date").reset_index(drop=True)
 
-print("=" * 65)
-print("  Nahr Ibrahim — Train / Validation / Test Split")
-print("=" * 65)
-print(f"\n  Master dataset : {len(df)} rows")
-print(f"  Period         : {df.date.min().date()} → {df.date.max().date()}")
-print(f"  Columns        : {df.columns.tolist()}")
+print(
+    f"Master dataset: {len(df)} rows  "
+    f"({df.date.min().date()} → {df.date.max().date()})\n"
+)
 
-# =============================================================================
-# SPLIT BOUNDARIES
-# =============================================================================
+# ── Chronological split ────────────────────────────────────────────────────────
+# No shuffling — time series must stay in order to avoid data leakage.
+# Boundaries chosen to give roughly 70/11/19% and keep whole years together.
 TRAIN_END = "2017-12-31"
-VAL_END   = "2020-12-31"
+VAL_END = "2020-12-31"
 
-train = df[df["date"] <= TRAIN_END].reset_index(drop=True)
-val   = df[(df["date"] > TRAIN_END) & (df["date"] <= VAL_END)].reset_index(drop=True)
-test  = df[df["date"] > VAL_END].reset_index(drop=True)
+train = df[df.date <= TRAIN_END].reset_index(drop=True)
+val = df[(df.date > TRAIN_END) & (df.date <= VAL_END)].reset_index(drop=True)
+test = df[df.date > VAL_END].reset_index(drop=True)
 
 total = len(df)
-print(f"\n  {'Split':<12} {'Start':<12} {'End':<12} {'Days':>6} {'Pct':>6}")
-print(f"  {'-'*52}")
-print(f"  {'Train':<12} {str(train.date.min().date()):<12} "
-      f"{str(train.date.max().date()):<12} {len(train):>6} "
-      f"{len(train)/total*100:>5.1f}%")
-print(f"  {'Validation':<12} {str(val.date.min().date()):<12} "
-      f"{str(val.date.max().date()):<12} {len(val):>6} "
-      f"{len(val)/total*100:>5.1f}%")
-print(f"  {'Test':<12} {str(test.date.min().date()):<12} "
-      f"{str(test.date.max().date()):<12} {len(test):>6} "
-      f"{len(test)/total*100:>5.1f}%")
-print(f"  {'-'*52}")
-print(f"  {'Total':<12} {'':>12} {'':>12} {total:>6} {'100.0%':>6}")
+print(f"{'Split':<12} {'Period':<24} {'Days':>6} {'%':>6}")
+print("-" * 52)
+for name, s in [("Train", train), ("Validation", val), ("Test", test)]:
+    period = f"{s.date.min().date()} → {s.date.max().date()}"
+    print(f"{name:<12} {period:<24} {len(s):>6} {len(s) / total * 100:>5.1f}%")
+print("-" * 52)
+print(f"{'Total':<12} {'':<24} {total:>6}  100.0%\n")
 
-# =============================================================================
-# STATISTICS PER SPLIT
-# =============================================================================
-print(f"\n  Variable statistics per split:")
-print(f"  {'Variable':<25} {'Train mean':>12} {'Val mean':>12} {'Test mean':>12}")
-print(f"  {'-'*64}")
-
-check_cols = [
-    "precip_mm_day", "temp_mean_c", "swe_mm",
-    "snow_cover_pct", "soil_moisture_mm", "pet_mm_day",
+# ── Per-split statistics ───────────────────────────────────────────────────────
+# Useful to spot distribution shift between train and test — a non-stationary
+# series is the core motivation for climate-resilient modelling.
+stats_cols = [
+    "precip_mm_day",
+    "temp_mean_c",
+    "swe_mm",
+    "snow_cover_pct",
+    "soil_moisture_mm",
+    "pet_mm_day",
     "discharge_m3s",
 ]
-for col in check_cols:
+print(f"{'Variable':<25} {'Train':>10} {'Val':>10} {'Test':>10}")
+print("-" * 58)
+for col in stats_cols:
     if col in df.columns:
-        print(f"  {col:<25} {train[col].mean():>12.3f} "
-              f"{val[col].mean():>12.3f} {test[col].mean():>12.3f}")
+        print(
+            f"{col:<25} {train[col].mean():>10.3f} "
+            f"{val[col].mean():>10.3f} {test[col].mean():>10.3f}"
+        )
 
-# =============================================================================
-# FEATURE COLUMNS — 16 total
-# =============================================================================
+# ── Feature list ───────────────────────────────────────────────────────────────
+# 18 features in the exact order the models expect.
+# Indices 12–15 are the four new additions over the original 12.
 FEATURE_COLS = [
-    "precip_mm_day", "precip_3day",    "precip_7day",     # indices 0,1,2
-    "temp_mean_c",   "temp_max_c",     "temp_min_c",      # indices 3,4,5
-    "temp_range_c",  "swe_mm",         "swe_delta",       # indices 6,7,8
-    "snow_cover_pct","month_sin",      "month_cos",       # indices 9,10,11
-    "soil_moisture_mm","sm_7day_mean", "sm_anomaly",      # indices 12,13,14
-    "pet_mm_day",                                         # index 15
+    "precip_mm_day",
+    "precip_3day",
+    "precip_7day",
+    "temp_mean_c",
+    "temp_max_c",
+    "temp_min_c",
+    "temp_range_c",
+    "swe_mm",
+    "swe_delta",
+    "snow_cover_pct",
+    "month_sin",
+    "month_cos",
+    "soil_moisture_mm",
+    "sm_7day_mean",
+    "sm_anomaly",
+    "pet_mm_day",
+    "spi_3month",
+    "spei_3month",
 ]
-target_col = "discharge_m3s"
+TARGET = "discharge_m3s"
+NEW = {"soil_moisture_mm", "sm_7day_mean", "sm_anomaly", "pet_mm_day"}
 
-print(f"\n  Feature columns ({len(FEATURE_COLS)}):")
+print(f"\nFeatures ({len(FEATURE_COLS)}):")
 for i, col in enumerate(FEATURE_COLS):
-    tag = " ← new" if col in [
-        "soil_moisture_mm","sm_7day_mean","sm_anomaly","pet_mm_day"
-    ] else ""
-    print(f"    [{i:>2}] {col}{tag}")
+    tag = "  ← new" if col in NEW else ""
+    print(f"  [{i:>2}] {col}{tag}")
 
-# =============================================================================
-# NORMALISATION — fit on training set only
-# =============================================================================
-print(f"\n  Fitting normaliser on training set only ...")
+# ── Min-max normalisation ──────────────────────────────────────────────────────
+# Scaler fitted on the training set only — applying it to val/test simulates
+# the real deployment scenario where future statistics are unknown.
+all_cols = FEATURE_COLS + [TARGET]
+train_min = train[all_cols].min()
+train_max = train[all_cols].max()
 
-train_min   = train[FEATURE_COLS + [target_col]].min()
-train_max   = train[FEATURE_COLS + [target_col]].max()
-train_range = train_max - train_min
-
-scaler_df = pd.DataFrame({"min": train_min, "max": train_max})
-scaler_df.to_csv(SPLIT_DIR / "scaler_params.csv")
-print(f"  Scaler parameters saved → data/splits/scaler_params.csv")
+scaler = pd.DataFrame({"min": train_min, "max": train_max})
+scaler.to_csv(SPLIT_DIR / "scaler_params.csv")
+print(f"\nScaler saved → data/splits/scaler_params.csv")
 
 
-def normalize(df_in, cols, min_vals, max_vals):
-    df_out = df_in.copy()
+def normalise(df_in, cols, lo, hi):
+    out = df_in.copy()
     for col in cols:
-        r = max_vals[col] - min_vals[col]
-        df_out[col] = 0.0 if r == 0 else (df_in[col] - min_vals[col]) / r
-    return df_out
+        r = hi[col] - lo[col]
+        out[col] = 0.0 if r == 0 else (df_in[col] - lo[col]) / r
+    return out
 
 
-all_cols = FEATURE_COLS + [target_col]
-train_norm = normalize(train, all_cols, train_min, train_max)
-val_norm   = normalize(val,   all_cols, train_min, train_max)
-test_norm  = normalize(test,  all_cols, train_min, train_max)
+train_norm = normalise(train, all_cols, train_min, train_max)
+val_norm = normalise(val, all_cols, train_min, train_max)
+test_norm = normalise(test, all_cols, train_min, train_max)
 
-val_oob  = ((val_norm[FEATURE_COLS]  < 0) | (val_norm[FEATURE_COLS]  > 1)).sum().sum()
+# Report out-of-range values — expected for val/test under climate shift
+val_oob = ((val_norm[FEATURE_COLS] < 0) | (val_norm[FEATURE_COLS] > 1)).sum().sum()
 test_oob = ((test_norm[FEATURE_COLS] < 0) | (test_norm[FEATURE_COLS] > 1)).sum().sum()
-print(f"  Out-of-range values: Val={val_oob} | Test={test_oob}")
-if val_oob > 0 or test_oob > 0:
-    print(f"  NOTE: Values outside training range are expected under climate shift")
+print(f"Out-of-range values: Val={val_oob}  Test={test_oob}")
+if val_oob or test_oob:
+    print("  (expected — reflects warming trend and distribution shift)")
 
-# =============================================================================
-# SAVE SPLITS
-# =============================================================================
-train.to_csv(SPLIT_DIR / "train_raw.csv",  index=False)
-val.to_csv(  SPLIT_DIR / "val_raw.csv",    index=False)
-test.to_csv( SPLIT_DIR / "test_raw.csv",   index=False)
+# ── Save splits ────────────────────────────────────────────────────────────────
+keep = ["date"] + FEATURE_COLS + [TARGET]
 
-keep_cols = ["date"] + FEATURE_COLS + [target_col]
-train_norm[keep_cols].to_csv(SPLIT_DIR / "train_norm.csv", index=False)
-val_norm[keep_cols].to_csv(  SPLIT_DIR / "val_norm.csv",   index=False)
-test_norm[keep_cols].to_csv( SPLIT_DIR / "test_norm.csv",  index=False)
+train.to_csv(SPLIT_DIR / "train_raw.csv", index=False)
+val.to_csv(SPLIT_DIR / "val_raw.csv", index=False)
+test.to_csv(SPLIT_DIR / "test_raw.csv", index=False)
+train_norm[keep].to_csv(SPLIT_DIR / "train_norm.csv", index=False)
+val_norm[keep].to_csv(SPLIT_DIR / "val_norm.csv", index=False)
+test_norm[keep].to_csv(SPLIT_DIR / "test_norm.csv", index=False)
 
-print(f"\n  Files saved:")
-print(f"    data/splits/train_raw.csv   ({len(train)} rows)")
-print(f"    data/splits/val_raw.csv     ({len(val)} rows)")
-print(f"    data/splits/test_raw.csv    ({len(test)} rows)")
-print(f"    data/splits/train_norm.csv  ({len(train_norm)} rows)")
-print(f"    data/splits/val_norm.csv    ({len(val_norm)} rows)")
-print(f"    data/splits/test_norm.csv   ({len(test_norm)} rows)")
-print(f"    data/splits/scaler_params.csv")
+print(f"\nSaved:")
+for name, n in [("train", len(train)), ("val", len(val)), ("test", len(test))]:
+    print(f"  data/splits/{name}_raw.csv  /  {name}_norm.csv  ({n} rows)")
+print(f"  data/splits/scaler_params.csv")
 
-# =============================================================================
-# VISUALIZATION
-# =============================================================================
-fig, axes = plt.subplots(2, 1, figsize=(16, 8))
+# ── Visualisation ──────────────────────────────────────────────────────────────
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 8))
 
-ax = axes[0]
-ax.fill_between(train["date"], train["discharge_m3s"],
-                alpha=0.4, color="steelblue", label="Train (2000–2017)")
-ax.fill_between(val["date"], val["discharge_m3s"],
-                alpha=0.6, color="orange", label="Validation (2018–2020)")
-ax.fill_between(test["date"], test["discharge_m3s"],
-                alpha=0.6, color="tomato", label="Test (2021–2025)")
-ax.axvline(pd.Timestamp(TRAIN_END), color="orange",
-           linestyle="--", linewidth=1.5)
-ax.axvline(pd.Timestamp(VAL_END),   color="tomato",
-           linestyle="--", linewidth=1.5)
-ax.set_title("Discharge Time Series — Train / Validation / Test Split",
-             fontsize=13)
-ax.set_ylabel("Discharge (m³/s)")
-ax.legend(loc="upper right")
-ax.grid(alpha=0.3)
+# time series coloured by split
+for s, color, label in [
+    (train, "steelblue", "Train (2000–2017)"),
+    (val, "orange", "Validation (2018–2020)"),
+    (test, "tomato", "Test (2021–2025)"),
+]:
+    ax1.fill_between(s.date, s.discharge_m3s, alpha=0.5, color=color, label=label)
 
-ax2 = axes[1]
+ax1.axvline(pd.Timestamp(TRAIN_END), color="orange", linestyle="--", linewidth=1.5)
+ax1.axvline(pd.Timestamp(VAL_END), color="tomato", linestyle="--", linewidth=1.5)
+ax1.set_title("Discharge time series — chronological split", fontsize=13)
+ax1.set_ylabel("Discharge (m³/s)")
+ax1.legend(loc="upper right")
+ax1.grid(alpha=0.3)
+
+# distribution comparison
 bp = ax2.boxplot(
-    [train["discharge_m3s"].values,
-     val["discharge_m3s"].values,
-     test["discharge_m3s"].values],
-    patch_artist=True, widths=0.5,
-    tick_labels=["Train\n(2000-2017)", "Validation\n(2018-2020)",
-            "Test\n(2021-2025)"]
+    [train.discharge_m3s.values, val.discharge_m3s.values, test.discharge_m3s.values],
+    patch_artist=True,
+    widths=0.5,
+    tick_labels=["Train\n2000–2017", "Validation\n2018–2020", "Test\n2021–2025"],
 )
-for patch, color in zip(bp["boxes"], ["steelblue","orange","tomato"]):
+for patch, color in zip(bp["boxes"], ["steelblue", "orange", "tomato"]):
     patch.set_facecolor(color)
     patch.set_alpha(0.6)
 
-ax2.set_title("Discharge Distribution per Split", fontsize=13)
+ax2.set_title("Discharge distribution per split", fontsize=13)
 ax2.set_ylabel("Discharge (m³/s)")
 ax2.grid(axis="y", alpha=0.3)
 
 plt.tight_layout()
-plt.savefig(FIG_DIR / "train_val_test_split.png",
-            dpi=150, bbox_inches="tight")
+plt.savefig(FIG_DIR / "train_val_test_split.png", dpi=150, bbox_inches="tight")
 plt.show()
-print(f"\n  Figure saved → results/figures/train_val_test_split.png")
-print("=" * 65)
+print(f"\nFigure saved → results/figures/train_val_test_split.png")

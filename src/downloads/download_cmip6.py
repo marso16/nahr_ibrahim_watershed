@@ -2,20 +2,20 @@ import ee
 import pandas as pd
 from pathlib import Path
 
-ee.Initialize(project='final-project-490411')
+ee.Initialize(project="final-project-490411")
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 NORTH = 34.16
 SOUTH = 34.02
-WEST  = 35.84
-EAST  = 35.96
+WEST = 35.84
+EAST = 35.96
 
-MODEL     = "MPI-ESM1-2-HR"
+MODEL = "MPI-ESM1-2-HR"
 SCENARIOS = ["ssp245", "ssp585"]
 VARIABLES = ["pr", "tas", "tasmin", "tasmax"]
-YEARS     = range(2015, 2101)
+YEARS = range(2015, 2101)
 
 OUTPUT_DIR = Path(r"data\raw\cmip6")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,8 +37,8 @@ print(f"  Output   : {OUTPUT_DIR}\n")
 # =============================================================================
 # GEE uses same names: pr, tas, tasmin, tasmax — confirmed from band check
 BAND_MAP = {
-    "pr"    : "pr",
-    "tas"   : "tas",
+    "pr": "pr",
+    "tas": "tas",
     "tasmin": "tasmin",
     "tasmax": "tasmax",
 }
@@ -46,10 +46,10 @@ BAND_MAP = {
 # =============================================================================
 # DOWNLOAD LOOP
 # =============================================================================
-total   = len(SCENARIOS) * len(VARIABLES) * len(YEARS)
-count   = 0
+total = len(SCENARIOS) * len(VARIABLES) * len(YEARS)
+count = 0
 results = {"ok": 0, "skipped": 0, "failed": 0}
-failed  = []
+failed = []
 
 for scenario in SCENARIOS:
     for variable in VARIABLES:
@@ -77,47 +77,56 @@ for scenario in SCENARIOS:
 
                 def extract(image):
                     mean = image.reduceRegion(
-                        reducer  = ee.Reducer.mean(),
-                        geometry = geometry,
-                        scale    = 25000,
-                        maxPixels= 1e9
+                        reducer=ee.Reducer.mean(),
+                        geometry=geometry,
+                        scale=25000,
+                        maxPixels=1e9,
                     )
-                    return ee.Feature(None, {
-                        "date" : image.date().format("YYYY-MM-dd"),
-                        "value": mean.get(band)
-                    })
+                    return ee.Feature(
+                        None,
+                        {
+                            "date": image.date().format("YYYY-MM-dd"),
+                            "value": mean.get(band),
+                        },
+                    )
 
-                fc   = ee.FeatureCollection(collection.map(extract))
+                fc = ee.FeatureCollection(collection.map(extract))
                 data = fc.getInfo()
 
                 records = []
                 for f in data["features"]:
-                    records.append({
-                        "date" : f["properties"]["date"],
-                        "value": f["properties"]["value"]
-                    })
+                    records.append(
+                        {
+                            "date": f["properties"]["date"],
+                            "value": f["properties"]["value"],
+                        }
+                    )
 
                 df = pd.DataFrame(records)
-                df["date"]  = pd.to_datetime(df["date"])
+                df["date"] = pd.to_datetime(df["date"])
                 df["value"] = pd.to_numeric(df["value"], errors="coerce")
                 df = df.sort_values("date").reset_index(drop=True)
                 df.to_csv(out_file, index=False)
 
-                print(f"[{count:>4}/{total}] {scenario}/{variable}/{year} → "
-                      f"ok ({len(df)} days | mean={df['value'].mean():.8f})")
+                print(
+                    f"[{count:>4}/{total}] {scenario}/{variable}/{year} → "
+                    f"ok ({len(df)} days | mean={df['value'].mean():.8f})"
+                )
                 results["ok"] += 1
 
             except Exception as e:
-                print(f"[{count:>4}/{total}] {scenario}/{variable}/{year} → FAILED — {e}")
+                print(
+                    f"[{count:>4}/{total}] {scenario}/{variable}/{year} → FAILED — {e}"
+                )
                 results["failed"] += 1
                 failed.append(f"{scenario}/{variable}/{year}")
 
 # =============================================================================
 # SUMMARY
 # =============================================================================
-print(f"\n{'='*55}")
+print(f"\n{'=' * 55}")
 print(f"  DOWNLOAD COMPLETE")
-print(f"{'='*55}")
+print(f"{'=' * 55}")
 print(f"  Downloaded : {results['ok']}")
 print(f"  Skipped    : {results['skipped']} (already existed)")
 print(f"  Failed     : {results['failed']}")
@@ -127,18 +136,20 @@ if failed:
     for f in failed[:10]:
         print(f"    {f}")
     if len(failed) > 10:
-        print(f"    ... and {len(failed)-10} more")
+        print(f"    ... and {len(failed) - 10} more")
     print(f"\n  Rerun to retry failed files automatically.")
 
 print(f"\n  Verifying completeness ...")
-print(f"  {'Scenario':<10} {'Variable':<10} {'Files':>8} {'Expected':>10} {'Status':>10}")
-print(f"  {'-'*52}")
-expected    = len(YEARS)
+print(
+    f"  {'Scenario':<10} {'Variable':<10} {'Files':>8} {'Expected':>10} {'Status':>10}"
+)
+print(f"  {'-' * 52}")
+expected = len(YEARS)
 all_complete = True
 for scenario in SCENARIOS:
     for variable in VARIABLES:
         folder = OUTPUT_DIR / scenario / variable
-        found  = len(list(folder.glob("*.csv"))) if folder.exists() else 0
+        found = len(list(folder.glob("*.csv"))) if folder.exists() else 0
         status = "Complete" if found == expected else f"{found}/{expected}"
         if found != expected:
             all_complete = False
@@ -148,4 +159,4 @@ if all_complete:
     print(f"\n  All files downloaded.")
 else:
     print(f"\n  Some files missing. Rerun to retry.")
-print(f"{'='*55}")
+print(f"{'=' * 55}")

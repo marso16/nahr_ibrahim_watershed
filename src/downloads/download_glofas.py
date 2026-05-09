@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==================================================
 # CONFIG
 # ==================================================
-DATASET = "cems-glofas-historical" 
+DATASET = "cems-glofas-historical"
 OUTPUT_DIR = r"data\raw\glofas"
 STATE_FILE = r"C:\Users\marck\Downloads\nahr_ibrahim_watershed\download_state.json"
 YEARS = range(2000, 2026)
@@ -20,6 +20,7 @@ MAX_RETRIES = 6
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 client = cdsapi.Client()
+
 
 # ==================================================
 # STATE MANAGEMENT
@@ -39,6 +40,7 @@ def save_state(state):
 state = load_state()
 done_set = set(state["done"])
 
+
 # ==================================================
 # REQUEST BUILDER
 # ==================================================
@@ -54,6 +56,7 @@ def build_request(year, month):
         "download_format": "zip",
         "area": [34.16, 35.84, 34.02, 35.96],
     }
+
 
 # ==================================================
 # DOWNLOAD FUNCTION
@@ -87,7 +90,7 @@ def download_chunk(year, month):
             return f"[OK] {key}"
 
         except Exception as e:
-            wait = min(120, (2 ** attempt) + random.random() * 2)
+            wait = min(120, (2**attempt) + random.random() * 2)
             print(f"[RETRY] {key} attempt {attempt} failed: {e}")
             print(f"         waiting {wait:.1f}s")
 
@@ -99,12 +102,8 @@ def download_chunk(year, month):
 # ==================================================
 # WORK LIST
 # ==================================================
-tasks = [
-    (y, m)
-    for y in YEARS
-    for m in MONTHS
-    if f"{y}-{m:02d}" not in done_set
-]
+tasks = [(y, m) for y in YEARS for m in MONTHS if f"{y}-{m:02d}" not in done_set]
+
 
 # ==================================================
 # RUN PARALLEL
@@ -113,10 +112,7 @@ def main():
     print(f"Total remaining chunks: {len(tasks)}")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(download_chunk, y, m): (y, m)
-            for (y, m) in tasks
-        }
+        futures = {executor.submit(download_chunk, y, m): (y, m) for (y, m) in tasks}
 
         for f in as_completed(futures):
             y, m = futures[f]
@@ -127,6 +123,7 @@ def main():
                 print(f"[CRASH] {y}-{m:02d}: {e}")
 
     print("\nDONE")
+
 
 if __name__ == "__main__":
     main()

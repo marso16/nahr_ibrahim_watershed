@@ -2,7 +2,7 @@ import ee
 import pandas as pd
 from pathlib import Path
 
-ee.Initialize(project='final-project-490411')
+ee.Initialize(project="final-project-490411")
 
 OUTPUT = Path(r"data\raw\chirps")
 OUTPUT.mkdir(parents=True, exist_ok=True)
@@ -11,44 +11,45 @@ geometry = ee.Geometry.Rectangle([35.84, 34.02, 35.96, 34.16])
 
 NORTH = 34.16
 SOUTH = 34.02
-WEST  = 35.84
-EAST  = 35.96
+WEST = 35.84
+EAST = 35.96
 
 all_records = []
 
 for year in range(2000, 2026):
     print(f"  [{year}] ...", end=" ", flush=True)
 
-    chirps = (ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
-                .filterDate(f"{year}-01-01", f"{year}-12-31")
-                .filterBounds(geometry)
-                .select("precipitation"))
+    chirps = (
+        ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+        .filterDate(f"{year}-01-01", f"{year}-12-31")
+        .filterBounds(geometry)
+        .select("precipitation")
+    )
 
     def extract_mean(image):
         mean = image.reduceRegion(
-            reducer   = ee.Reducer.mean(),
-            geometry  = geometry,
-            scale     = 5000,
-            maxPixels = 1e9
+            reducer=ee.Reducer.mean(), geometry=geometry, scale=5000, maxPixels=1e9
         )
-        return ee.Feature(None, {
-            "date"          : image.date().format("YYYY-MM-dd"),
-            "precip_mm_day" : mean.get("precipitation")
-        })
+        return ee.Feature(
+            None,
+            {
+                "date": image.date().format("YYYY-MM-dd"),
+                "precip_mm_day": mean.get("precipitation"),
+            },
+        )
 
-    fc   = ee.FeatureCollection(chirps.map(extract_mean))
-    data = fc.getInfo()  
+    fc = ee.FeatureCollection(chirps.map(extract_mean))
+    data = fc.getInfo()
 
     records = []
     for f in data["features"]:
         props = f["properties"]
-        records.append({
-            "date"          : props.get("date"),
-            "precip_mm_day" : props.get("precip_mm_day")
-        })
+        records.append(
+            {"date": props.get("date"), "precip_mm_day": props.get("precip_mm_day")}
+        )
 
     df_year = pd.DataFrame(records)
-    df_year["date"]          = pd.to_datetime(df_year["date"])
+    df_year["date"] = pd.to_datetime(df_year["date"])
     df_year["precip_mm_day"] = pd.to_numeric(
         df_year["precip_mm_day"], errors="coerce"
     ).clip(lower=0)
@@ -68,7 +69,20 @@ print(f"  Max   : {df['precip_mm_day'].max():.2f} mm/day")
 
 df["month"] = df["date"].dt.month
 monthly = df.groupby("month")["precip_mm_day"].mean()
-names   = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+names = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+]
 print(f"\n  Monthly means:")
 for m, name in enumerate(names, 1):
     bar = "█" * int(monthly.get(m, 0) / 2)
