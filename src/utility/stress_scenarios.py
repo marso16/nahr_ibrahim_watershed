@@ -10,6 +10,9 @@ SCEN_DIR = ROOT / "results" / "scenarios"
 FIG_DIR = ROOT / "results" / "figures"
 MET_DIR = ROOT / "results" / "metrics"
 
+FIG_DIR.mkdir(parents=True, exist_ok=True)
+MET_DIR.mkdir(parents=True, exist_ok=True)
+
 # =============================================================================
 # LOAD SCENARIO RESULTS
 # =============================================================================
@@ -21,7 +24,11 @@ df["year"] = df["date"].dt.year
 
 # Model columns
 model_cols = [c for c in df.columns if c.startswith("Q_") and "ensemble" not in c]
-print(f"  Models: {[c.replace('Q_', '') for c in model_cols]}")
+print(f"  Models found : {len(model_cols)}")
+print(f"  Model names  : {[c.replace('Q_', '') for c in model_cols]}")
+if len(model_cols) != 7:
+    print(f"  WARNING: expected 7 models, got {len(model_cols)}")
+    print(f"  Run climate_scenarios.py first to generate updated CSVs")
 
 # Annual means per model
 annual = df.groupby("year")[model_cols].mean()

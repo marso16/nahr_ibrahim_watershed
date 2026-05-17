@@ -156,12 +156,15 @@ custom_obj = {
     "TransformerEncoderBlock": TransformerEncoderBlock,
 }
 
+# NEW
 model_paths = {
     "LSTM": MODEL_DIR / "lstm_final.keras",
     "CNN-LSTM": MODEL_DIR / "cnn_lstm_final.keras",
     "Transformer": MODEL_DIR / "transformer_final.keras",
     "PI-LSTM": MODEL_DIR / "pi_lstm_final.keras",
     "PI-Transformer": MODEL_DIR / "pi_transformer_final.keras",
+    "TCN": MODEL_DIR / "tcn_final.keras",
+    "TCAN": MODEL_DIR / "tcan_final.keras",
 }
 
 print("Loading models:")
@@ -377,7 +380,7 @@ def predict_scenario(scenario):
     # ensemble columns
     pure = [
         f"Q_{n}"
-        for n in ["LSTM", "CNN-LSTM", "Transformer"]
+        for n in ["LSTM", "CNN-LSTM", "Transformer", "TCN", "TCAN"]
         if f"Q_{n}" in df and not df[f"Q_{n}"].isna().all()
     ]
     pi = [
@@ -470,6 +473,8 @@ key_models = [
     "LSTM",
     "CNN-LSTM",
     "Transformer",
+    "TCN",
+    "TCAN",
     "PI-LSTM",
     "PI-Transformer",
     "ensemble_pure",
@@ -506,6 +511,8 @@ COLORS = {
     "LSTM": "#3b9eff",
     "CNN-LSTM": "#00b4a0",
     "Transformer": "#00d4ff",
+    "TCN": "#a855f7",
+    "TCAN": "#22d3ee",
     "PI-LSTM": "#f4a261",
     "PI-Transformer": "#e76f51",
     "ensemble_pure": "#8aafc4",
@@ -543,7 +550,15 @@ for ax, (scen, label) in zip(
     df["year"] = df["date"].dt.year
     ann = df.groupby("year").mean(numeric_only=True)
 
-    for name in ["LSTM", "CNN-LSTM", "Transformer", "PI-LSTM", "PI-Transformer"]:
+    for name in [
+        "LSTM",
+        "CNN-LSTM",
+        "Transformer",
+        "TCN",
+        "TCAN",
+        "PI-LSTM",
+        "PI-Transformer",
+    ]:
         col = f"Q_{name}"
         if col not in ann or ann[col].isna().all():
             continue
