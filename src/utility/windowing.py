@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -5,7 +6,9 @@ import matplotlib.gridspec as gridspec
 from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-ROOT = Path("C:/Users/marck/Downloads/nahr_ibrahim_watershed")
+ROOT = Path(
+    os.environ.get("WATERSHED_ROOT", "C:/Users/marck/Downloads/nahr_ibrahim_watershed")
+)
 SPLIT_DIR = ROOT / "data" / "splits"
 SEQ_DIR = ROOT / "data" / "sequences"
 FIG_DIR = ROOT / "results" / "figures"
@@ -13,14 +16,18 @@ FIG_DIR = ROOT / "results" / "figures"
 SEQ_DIR.mkdir(parents=True, exist_ok=True)
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-LOOKBACK = 30  # days of history the model sees
+LOOKBACK = 30
 HORIZON = 1  # predict one day ahead
 
-# 19 features — order must match split.py and climate_scenarios.py exactly
 FEATURE_COLS = [
     "precip_mm_day",
     "precip_3day",
     "precip_7day",
+    "precip_lag1",  # NEW
+    "precip_lag2",  # NEW
+    "precip_lag3",  # NEW
+    "precip_lag5",  # NEW
+    "api_15d",  # NEW
     "temp_mean_c",
     "temp_max_c",
     "temp_min_c",
@@ -45,7 +52,7 @@ print(
 )
 
 
-# ── Load normalised splits ──────────────────────────────────────────────────────
+# ── Load normalised splits ─────────────────────────────────────────────────────
 train_df = pd.read_csv(SPLIT_DIR / "train_norm.csv", parse_dates=["date"])
 val_df = pd.read_csv(SPLIT_DIR / "val_norm.csv", parse_dates=["date"])
 test_df = pd.read_csv(SPLIT_DIR / "test_norm.csv", parse_dates=["date"])
@@ -58,11 +65,7 @@ if missing:
 print(f"All {len(FEATURE_COLS)} feature columns present\n")
 
 
-# ── Sliding window ──────────────────────────────────────────────────────────────
-# For each position i we take the previous `lookback` rows as input and the
-# value at position i + horizon - 1 as the target.
-# Returns X of shape (n, lookback, n_features), y of shape (n,), and
-# the calendar date each prediction corresponds to.
+# ── Sliding window ─────────────────────────────────────────────────────────────
 def make_sequences(df, features, target, lookback, horizon):
     X, y, dates = [], [], []
     feat_arr = df[features].values
@@ -75,7 +78,7 @@ def make_sequences(df, features, target, lookback, horizon):
     return (
         np.array(X, dtype=np.float32),
         np.array(y, dtype=np.float32),
-        np.array(dates),
+        np.array(dates, dtype="datetime64[ns]"),
     )
 
 
@@ -100,42 +103,14 @@ for name, X, y in [
 print(f"{'Total':<8} {'':<26} {len(y_train) + len(y_val) + len(y_test):>8,}\n")
 
 
-# ── Integrity checks ────────────────────────────────────────────────────────────
-# swe_delta on day 1 is always NaN (diff has no predecessor) — fix it here
-# rather than in preprocess so the root cause is documented.
-nan_x = np.isnan(X_train).sum()
-if nan_x:
-    print(f"Fixing {nan_x} NaN(s) in X_train (expected: swe_delta day 1) → 0")
-    X_train[np.isnan(X_train)] = 0.0
-
-ok = True
-for name, X, y in [
-    ("Train", X_train, y_train),
-    ("Val", X_val, y_val),
-    ("Test", X_test, y_test),
-]:
-    nx, ny = np.isnan(X).sum(), np.isnan(y).sum()
-    if nx or ny:
-        print(f"  problem  {name}: {nx} NaN in X, {ny} NaN in y")
-        ok = False
-    else:
-        print(f"  ok       {name}: no NaN")
-
+# ── Integrity checks ───────────────────────────────────────────────────────────
 for name, X in [("Train", X_train), ("Val", X_val), ("Test", X_test)]:
-    oob = ((X < -0.1) | (X > 1.1)).sum()
-    if oob:
-        print(
-            f"  note     {name}: {oob} values outside [0,1] "
-            f"(expected — climate shift beyond training range)"
-        )
-    else:
-        print(f"  ok       {name}: all values in range")
+    n = np.isnan(X).sum()
+    assert n == 0, f"{name} has {n} NaN(s) — fix in preprocess.py, not here"
 
-if ok:
-    print("\nAll checks passed")
+print("All integrity checks passed")
 
-
-# ── Save arrays ─────────────────────────────────────────────────────────────────
+# ── Save arrays ───────────────────────────────────────────────────────────────
 for fname, arr in [
     ("X_train", X_train),
     ("y_train", y_train),
@@ -174,80 +149,161 @@ pd.DataFrame(
     }
 ).to_csv(SEQ_DIR / "sequence_metadata.csv", index=False)
 
+import json
+
+with open(SEQ_DIR / "features.json", "w") as f:
+    json.dump(
+        {
+            "feature_cols": FEATURE_COLS,
+            "target": TARGET,
+            "lookback": LOOKBACK,
+            "horizon": HORIZON,
+        },
+        f,
+        indent=2,
+    )
+
 total_mb = sum(a.nbytes for a in [X_train, X_val, X_test, y_train, y_val, y_test]) / 1e6
 print(f"\nArrays saved → data/sequences/  ({total_mb:.1f} MB total)")
 print(f"  X_train {X_train.shape}  X_val {X_val.shape}  X_test {X_test.shape}")
 
 
-# ── Figures ─────────────────────────────────────────────────────────────────────
+# ── Figures ───────────────────────────────────────────────────────────────────
 def style(ax):
-    ax.set_facecolor("#0d1825")
-    ax.tick_params(colors="#4a6a82")
-    ax.spines[:].set_color("#1e3448")
+    ax.set_facecolor("#ffffff")
+    ax.tick_params(colors="#333333")
+    ax.spines[:].set_color("#cccccc")
+
+    ax.title.set_color("#111111")
+    ax.xaxis.label.set_color("#444444")
+    ax.yaxis.label.set_color("#444444")
 
 
 fig = plt.figure(figsize=(18, 12))
-fig.patch.set_facecolor("#080f1a")
-gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+fig.patch.set_facecolor("#ffffff")
+
+gs = gridspec.GridSpec(
+    2,
+    3,
+    figure=fig,
+    hspace=0.4,
+    wspace=0.35,
+)
 
 # panel 1 — sliding window diagram
 ax0 = fig.add_subplot(gs[0, :2])
 style(ax0)
-t = np.arange(45)
+
+t = np.arange(LOOKBACK + 15)
 rng = np.random.RandomState(42)
-demo = np.sin(t * 0.25) * 0.3 + 0.5 + rng.randn(45) * 0.05
+
+demo = np.sin(t * 0.25) * 0.3 + 0.5 + rng.randn(LOOKBACK + 15) * 0.05
 
 ax0.fill_between(
     t[:LOOKBACK],
     demo[:LOOKBACK],
     alpha=0.3,
-    color="#3b9eff",
-    label="Input window (30 days)",
+    color="#1f77b4",
+    label=f"Input window ({LOOKBACK} days)",
 )
+
 ax0.fill_between(
     t[LOOKBACK : LOOKBACK + 1],
     demo[LOOKBACK : LOOKBACK + 1],
     alpha=0.8,
-    color="#e76f51",
+    color="#d62728",
     label="Target (day t+1)",
 )
-ax0.plot(t, demo, color="#8aafc4", linewidth=1.2, alpha=0.6)
-ax0.axvline(LOOKBACK, color="#e76f51", linestyle="--", linewidth=1.5, alpha=0.8)
-ax0.scatter([LOOKBACK], [demo[LOOKBACK]], color="#e76f51", s=80, zorder=5)
+
+ax0.plot(
+    t,
+    demo,
+    color="#4c72b0",
+    linewidth=1.2,
+    alpha=0.7,
+)
+
+ax0.axvline(
+    LOOKBACK,
+    color="#d62728",
+    linestyle="--",
+    linewidth=1.5,
+    alpha=0.8,
+)
+
+ax0.scatter(
+    [LOOKBACK],
+    [demo[LOOKBACK]],
+    color="#d62728",
+    s=80,
+    zorder=5,
+)
+
 ax0.annotate(
-    "← 30-day input →",
-    xy=(14, 0.92),
+    f"← {LOOKBACK}-day input →",
+    xy=(LOOKBACK / 2, 0.92),
     fontsize=10,
-    color="#3b9eff",
+    color="#1f77b4",
     fontfamily="monospace",
     ha="center",
 )
+
 ax0.annotate(
     "Predict\nday t+1",
     xy=(LOOKBACK, demo[LOOKBACK] + 0.08),
     fontsize=9,
-    color="#e76f51",
+    color="#d62728",
     fontfamily="monospace",
     ha="center",
 )
+
 ax0.set_title(
-    f"Sliding window — {LOOKBACK}-day lookback · 1-day ahead · "
-    f"{len(FEATURE_COLS)} features",
-    color="#e8f4f8",
+    f"Sliding window — {LOOKBACK}-day lookback · "
+    f"1-day ahead · {len(FEATURE_COLS)} features",
     fontsize=11,
     pad=10,
 )
-ax0.set_xlabel("Time (days)", color="#8aafc4")
-ax0.set_ylabel("Normalised discharge", color="#8aafc4")
-ax0.legend(facecolor="#0d1825", edgecolor="#1e3448", labelcolor="#8aafc4", fontsize=9)
+
+ax0.set_xlabel("Time (days)")
+ax0.set_ylabel("Normalised discharge")
+
+ax0.legend(
+    facecolor="#ffffff",
+    edgecolor="#cccccc",
+    labelcolor="#333333",
+    fontsize=9,
+)
 
 # panel 2 — sequence counts
 ax1 = fig.add_subplot(gs[0, 2])
 style(ax1)
-labels = ["Train\n2000–2017", "Val\n2018–2020", "Test\n2021–2025"]
-counts = [len(y_train), len(y_val), len(y_test)]
-colors = ["#3b9eff", "#f4a261", "#e76f51"]
-bars = ax1.bar(labels, counts, color=colors, alpha=0.8, width=0.5)
+
+labels = [
+    "Train\n2000–2017",
+    "Val\n2018–2020",
+    "Test\n2021–2025",
+]
+
+counts = [
+    len(y_train),
+    len(y_val),
+    len(y_test),
+]
+
+colors = [
+    "#1f77b4",
+    "#ff7f0e",
+    "#d62728",
+]
+
+bars = ax1.bar(
+    labels,
+    counts,
+    color=colors,
+    alpha=0.85,
+    width=0.5,
+)
+
 for bar, n in zip(bars, counts):
     ax1.text(
         bar.get_x() + bar.get_width() / 2,
@@ -255,16 +311,23 @@ for bar, n in zip(bars, counts):
         f"{n:,}",
         ha="center",
         va="bottom",
-        color="#e8f4f8",
+        color="#111111",
         fontsize=9,
         fontfamily="monospace",
     )
-ax1.set_title("Sequence counts", color="#e8f4f8", fontsize=11, pad=10)
-ax1.set_ylabel("Number of sequences", color="#8aafc4")
+
+ax1.set_title(
+    "Sequence counts",
+    fontsize=11,
+    pad=10,
+)
+
+ax1.set_ylabel("Number of sequences")
 
 # panel 3 — feature heatmap for one example window
 ax2 = fig.add_subplot(gs[1, :2])
 style(ax2)
+
 im = ax2.imshow(
     X_train[500].T,
     aspect="auto",
@@ -273,26 +336,50 @@ im = ax2.imshow(
     vmax=1,
     interpolation="nearest",
 )
+
 ax2.set_yticks(range(len(FEATURE_COLS)))
-ax2.set_yticklabels(FEATURE_COLS, fontsize=7, color="#8aafc4", fontfamily="monospace")
-ax2.set_xlabel("Day in window (0 = oldest, 29 = latest)", color="#8aafc4")
+
+ax2.set_yticklabels(
+    FEATURE_COLS,
+    fontsize=7,
+    color="#444444",
+    fontfamily="monospace",
+)
+
+ax2.set_xlabel(f"Day in window (0 = oldest, {LOOKBACK-1} = latest)")
+
 ax2.set_title(
     "Feature heatmap — example window (sample #500)",
-    color="#e8f4f8",
     fontsize=11,
     pad=10,
 )
-cbar = plt.colorbar(im, ax=ax2, fraction=0.015, pad=0.02)
-cbar.set_label("Normalised value", color="#8aafc4", fontsize=8)
-plt.setp(cbar.ax.yaxis.get_ticklabels(), color="#4a6a82")
+
+cbar = plt.colorbar(
+    im,
+    ax=ax2,
+    fraction=0.015,
+    pad=0.02,
+)
+
+cbar.set_label(
+    "Normalised value",
+    color="#444444",
+    fontsize=8,
+)
+
+plt.setp(
+    cbar.ax.yaxis.get_ticklabels(),
+    color="#666666",
+)
 
 # panel 4 — target distribution
 ax3 = fig.add_subplot(gs[1, 2])
 style(ax3)
+
 for y, color, label in [
-    (y_train, "#3b9eff", "Train"),
-    (y_val, "#f4a261", "Val"),
-    (y_test, "#e76f51", "Test"),
+    (y_train, "#1f77b4", "Train"),
+    (y_val, "#ff7f0e", "Val"),
+    (y_test, "#d62728", "Test"),
 ]:
     ax3.hist(
         y,
@@ -303,15 +390,27 @@ for y, color, label in [
         density=True,
         orientation="horizontal",
     )
-ax3.set_title("Target (Q) distribution", color="#e8f4f8", fontsize=11, pad=10)
-ax3.set_ylabel("Normalised discharge", color="#8aafc4")
-ax3.set_xlabel("Density", color="#8aafc4")
-ax3.legend(facecolor="#0d1825", edgecolor="#1e3448", labelcolor="#8aafc4", fontsize=8)
+
+ax3.set_title(
+    "Target (Q) distribution",
+    fontsize=11,
+    pad=10,
+)
+
+ax3.set_ylabel("Normalised discharge")
+ax3.set_xlabel("Density")
+
+ax3.legend(
+    facecolor="#ffffff",
+    edgecolor="#cccccc",
+    labelcolor="#333333",
+    fontsize=8,
+)
 
 fig.suptitle(
-    f"Sequence windowing — {LOOKBACK}-day lookback · 1-day ahead · "
-    f"{len(FEATURE_COLS)} features",
-    color="#e8f4f8",
+    f"Sequence windowing — {LOOKBACK}-day lookback · "
+    f"1-day ahead · {len(FEATURE_COLS)} features",
+    color="#111111",
     fontsize=13,
     y=0.98,
     fontfamily="monospace",
@@ -321,7 +420,9 @@ plt.savefig(
     FIG_DIR / "sequence_windowing.png",
     dpi=150,
     bbox_inches="tight",
-    facecolor="#080f1a",
+    facecolor="#ffffff",
 )
-plt.show()
+
+plt.close()
+
 print("Figure saved → results/figures/sequence_windowing.png")

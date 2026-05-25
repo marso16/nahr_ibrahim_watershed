@@ -19,12 +19,18 @@ logging.getLogger("cfgrib").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-ROOT = Path("C:/Users/marck/Downloads/nahr_ibrahim_watershed")
+# ROOT can be set via the WATERSHED_ROOT env var; falls back to the original
+# Windows path for backward compatibility.
+import os
+
+ROOT = Path(
+    os.environ.get("WATERSHED_ROOT", "C:/Users/marck/Downloads/nahr_ibrahim_watershed")
+)
 RAW = ROOT / "data" / "raw"
 PROCESSED = ROOT / "data" / "processed"
 MASTER = ROOT / "data" / "master"
 
-ERA5_FILE = RAW / "era5" / "era5_precip_2000_2025_daily.csv"
+CHIRPS_FILE = RAW / "chirps" / "chirps_nahr_ibrahim_2000_2025_daily.csv"
 GIOVANNI = RAW / "giovanni"
 GLOFAS = RAW / "glofas"
 MODIS = RAW / "modis"
@@ -47,8 +53,6 @@ def to_study_period(df, col="date"):
 
 
 # ── Helper: parse NASA Giovanni area-averaged CSVs ─────────────────────────────
-# Giovanni exports have a variable number of header lines before the data starts.
-# We scan until we find a line beginning with "time," and read from there.
 def read_giovanni(path):
     with open(path) as f:
         lines = f.readlines()
@@ -84,17 +88,14 @@ def iqr_outliers(s, k=3.0):
 
 
 # ==============================================================================
-# 1. Precipitation — ERA5-Land total_precipitation (daily sum, mm/day)
-#    Downloaded via GEE: ECMWF/ERA5_LAND/DAILY_AGGR, spatially averaged
-#    over the spring recharge bounding box (34.02–34.16N, 35.84–35.96E)
+# 1. Precipitation (CHIRPS v2.0)
 # ==============================================================================
-print("[1/6] Precipitation (ERA5-Land) ...")
-(PROCESSED / "precip_era5_daily.csv").unlink(missing_ok=True)
+print("[1/6] Precipitation (CHIRPS v2.0) ...")
+(PROCESSED / "precip_chirps_daily.csv").unlink(missing_ok=True)
 
-precip = pd.read_csv(ERA5_FILE, parse_dates=["date"])
+precip = pd.read_csv(CHIRPS_FILE, parse_dates=["date"])
 precip = to_study_period(precip)
 
-# Sanity checks
 neg = precip["precip_mm_day"] < 0
 if neg.any():
     print(f"  {neg.sum()} negative values clipped to 0")
@@ -103,7 +104,7 @@ if neg.any():
 n_outliers = iqr_outliers(precip["precip_mm_day"]).sum()
 print(f"  IQR outlier check: {n_outliers} flagged (retained — extreme rain events)")
 
-precip.to_csv(PROCESSED / "precip_era5_daily.csv", index=False)
+precip.to_csv(PROCESSED / "precip_chirps_daily.csv", index=False)
 print(
     f"  {len(precip)} days | mean {precip.precip_mm_day.mean():.2f} mm/day "
     f"| max {precip.precip_mm_day.max():.1f} mm/day\n"
@@ -111,10 +112,7 @@ print(
 
 
 # ==============================================================================
-# 2. Temperature — MERRA-2 T2MMEAN/T2MMAX/T2MMIN (hourly → daily)
-#    Area-averaged over watershed bounding box via NASA Giovanni.
-#    Single Giovanni file provides all three statistics as hourly values;
-#    we resample to daily mean/max/min here.
+# 2. Temperature (MERRA-2)
 # ==============================================================================
 print("[2/6] Temperature (MERRA-2) ...")
 (PROCESSED / "temp_merra2_daily.csv").unlink(missing_ok=True)
@@ -147,9 +145,7 @@ print(
 
 
 # ==============================================================================
-# 3. Snow water equivalent — GLDAS Noah v2.1 SWE_inst (3-hourly → daily)
-#    Area-averaged via NASA Giovanni. Negative values are physical artefacts
-#    from the land surface model and are set to zero.
+# 3. Snow water equivalent (GLDAS Noah)
 # ==============================================================================
 print("[3/6] SWE (GLDAS Noah) ...")
 (PROCESSED / "swe_gldas_daily.csv").unlink(missing_ok=True)
@@ -172,10 +168,7 @@ print(f"  {len(swe)} days | range {swe.swe_mm.min():.1f}–{swe.swe_mm.max():.1f
 
 
 # ==============================================================================
-# 4. Soil moisture — GLDAS Noah v2.1 SoilMoi0_10cm (3-hourly → daily)
-#    0–10 cm layer, area-averaged via NASA Giovanni.
-#    If the file is missing (not yet downloaded), we fill with NaN and rely
-#    on gap-filling later — the pipeline will still run.
+# 4. Soil moisture (GLDAS Noah 0–10 cm)
 # ==============================================================================
 print("[4/6] Soil moisture (GLDAS Noah 0–10 cm) ...")
 (PROCESSED / "soil_moisture_gldas_daily.csv").unlink(missing_ok=True)
@@ -210,12 +203,7 @@ print(f"  {len(sm)} days saved\n")
 
 
 # ==============================================================================
-# 5. River discharge — GloFAS ERA5 v4.0 (daily, m³/s)
-#    Downloaded from Copernicus CDS as monthly GRIB files and extracted at
-#    the watershed centroid using nearest-neighbour interpolation.
-#    Monthly ZIPs were unzipped into data/raw/glofas/unzipped/.
-#    The 2013 and 2014 full-year files are named glofas_2013.grib /
-#    glofas_2014.grib to avoid data.grib naming collisions.
+# 5. River discharge (GloFAS ERA5 v4.0)
 # ==============================================================================
 print("[5/6] River discharge (GloFAS ERA5 v4.0) ...")
 (PROCESSED / "discharge_glofas_daily.csv").unlink(missing_ok=True)
@@ -264,12 +252,7 @@ print(
 
 
 # ==============================================================================
-# 6. Snow cover — MODIS MOD10A1.061 (daily, %)
-#    Downloaded via NASA AppEEARS as GeoTIFFs, chunked by 5-year periods.
-#    Each tile is clipped to the watershed polygon and the fraction of pixels
-#    with NDSI >= 40 is used as the snow cover estimate (standard threshold).
-#    Duplicate dates (from overlapping chunks) keep the highest value —
-#    this selects the least-cloudy observation for that day.
+# 6. Snow cover (MODIS MOD10A1.061)
 # ==============================================================================
 print("[6/6] Snow cover (MODIS MOD10A1.061) ...")
 (PROCESSED / "snow_cover_modis_daily.csv").unlink(missing_ok=True)
@@ -319,13 +302,6 @@ print(
 
 # ==============================================================================
 # 7. Build master dataset
-#    All variables are merged onto a complete daily index for 2000–2025.
-#    Gap-filling strategy:
-#      - Snow cover  : linear interpolation ≤5 days, then monthly climatology
-#      - SWE         : linear interpolation ≤3 days
-#      - Soil moisture: linear interpolation ≤5 days, then 30-day rolling mean
-#      - Temperature : linear interpolation ≤3 days
-#      - Precipitation: missing → 0 (ERA5-Land has very few gaps)
 # ==============================================================================
 print("[7/7] Building master dataset ...")
 (MASTER / "nahr_ibrahim_master_full.csv").unlink(missing_ok=True)
@@ -333,7 +309,7 @@ print("[7/7] Building master dataset ...")
 
 idx = pd.DataFrame({"date": pd.date_range(START, END, freq="D")})
 
-p = pd.read_csv(PROCESSED / "precip_era5_daily.csv", parse_dates=["date"])
+p = pd.read_csv(PROCESSED / "precip_chirps_daily.csv", parse_dates=["date"])
 t = pd.read_csv(PROCESSED / "temp_merra2_daily.csv", parse_dates=["date"])
 s = pd.read_csv(PROCESSED / "swe_gldas_daily.csv", parse_dates=["date"])
 sm = pd.read_csv(PROCESSED / "soil_moisture_gldas_daily.csv", parse_dates=["date"])
@@ -356,7 +332,7 @@ df["snow_cover_pct"] = df["snow_cover_pct"].interpolate(method="linear", limit=5
 monthly_snow = df.groupby("month")["snow_cover_pct"].transform("mean")
 df["snow_cover_pct"] = df["snow_cover_pct"].fillna(monthly_snow)
 
-df["swe_mm"] = df["swe_mm"].interpolate(method="linear", limit=3)
+df["swe_mm"] = df["swe_mm"].interpolate(method="linear", limit=3).fillna(0.0)
 
 df["soil_moisture_mm"] = df["soil_moisture_mm"].interpolate(method="linear", limit=5)
 df["soil_moisture_mm"] = df["soil_moisture_mm"].fillna(
@@ -371,24 +347,39 @@ df["precip_mm_day"] = df["precip_mm_day"].fillna(0.0)
 df.drop(columns=["month"], inplace=True)
 
 # ── Derived features ───────────────────────────────────────────────────────────
-# Antecedent precipitation indices
 df["precip_3day"] = df["precip_mm_day"].rolling(3, min_periods=1).sum()
 df["precip_7day"] = df["precip_mm_day"].rolling(7, min_periods=1).sum()
-
-# Diurnal temperature range
 df["temp_range_c"] = df["temp_max_c"] - df["temp_min_c"]
-
-# Snowmelt proxy — daily SWE decrease (positive when snow melts)
-# fillna(0) handles the first row where diff() is undefined
 df["swe_delta"] = df["swe_mm"].diff().clip(upper=0).abs().fillna(0.0)
-
-# Soil moisture indices
 df["sm_7day_mean"] = df["soil_moisture_mm"].rolling(7, min_periods=1).mean()
 df["sm_anomaly"] = (
     df["soil_moisture_mm"] - df["soil_moisture_mm"].rolling(30, min_periods=7).mean()
 ).fillna(0.0)
 
-# Potential evapotranspiration — Hamon (1961), calibrated for ~34°N
+# ── Antecedent Precipitation Index (Kohler & Linsley 1951) ────────────────────
+# API_t = k * API_{t-1} + P_t
+# Captures soil-moisture-like catchment memory of past rainfall.
+# Decay constant k=0.92 → ~half-life of ~8 days, suitable for a flashy
+# Mediterranean catchment. Verify this choice for your catchment if you cite a
+# specific value in the paper.
+K_API = 0.92
+api = np.zeros(len(df))
+p = df["precip_mm_day"].fillna(0.0).values
+for i in range(1, len(df)):
+    api[i] = K_API * api[i - 1] + p[i]
+df["api_15d"] = api
+
+# ── Explicit precipitation lags ────────────────────────────────────────────────
+# The LSTM can learn these internally, but giving them explicitly often helps
+# when the response time of the catchment is short and the training set is
+# modest (~6.5k sequences here). Helps the model find the precip-discharge lag
+# faster.
+df["precip_lag1"] = df["precip_mm_day"].shift(1).fillna(0.0)
+df["precip_lag2"] = df["precip_mm_day"].shift(2).fillna(0.0)
+df["precip_lag3"] = df["precip_mm_day"].shift(3).fillna(0.0)
+df["precip_lag5"] = df["precip_mm_day"].shift(5).fillna(0.0)
+
+# PET — Hamon (1961), calibrated for ~34°N
 doy = df["date"].dt.dayofyear
 daylight = 12 + 4 * np.sin(2 * np.pi * (doy - 80) / 365)
 sat_vp = (
@@ -400,82 +391,86 @@ sat_vp = (
 df["pet_mm_day"] = (0.1651 * daylight * sat_vp).clip(lower=0)
 
 # ── Drought indices — SPI and SPEI ────────────────────────────────────────────
-# SPI-3  : Standardised Precipitation Index over 3-month rolling window
-#          Positive = wetter than normal, Negative = drier than normal
-#          Values < -1 indicate moderate drought, < -2 severe drought
-# SPEI-3 : Same but accounts for atmospheric water demand via PET
-#          More sensitive to warming-driven drought than SPI alone
+# IMPORTANT: To avoid look-ahead leakage into the test set, the gamma
+# distribution is fitted on the TRAINING PERIOD ONLY (dates ≤ TRAIN_END),
+# and the fitted parameters are then applied to the entire series.
+# This must match the train end used in split.py.
 from scipy.stats import norm, gamma as gamma_dist
 
+TRAIN_END_FOR_FIT = pd.Timestamp("2017-12-31")  # KEEP IN SYNC with split.py
 
-def compute_spi(precip_series, scale=3):
+
+def compute_spi(precip_series, dates, train_mask, scale=3):
+    """SPI fitted on training period only, applied everywhere."""
     rolling = precip_series.rolling(scale, min_periods=scale).sum()
     result = np.full(len(rolling), np.nan)
-    valid = rolling.notna() & (rolling > 0)
-    if valid.sum() < 10:
+
+    # Fit gamma on training-period rolling values only
+    train_vals = rolling[train_mask & rolling.notna() & (rolling > 0)].values
+    if len(train_vals) < 30:
+        # Not enough training data to fit
         return pd.Series(result, index=precip_series.index)
     try:
-        params = gamma_dist.fit(rolling[valid].values, floc=0)
+        params = gamma_dist.fit(train_vals, floc=0)
+    except Exception:
+        return pd.Series(result, index=precip_series.index)
+
+    # Apply fitted params to ENTIRE series
+    valid = rolling.notna() & (rolling > 0)
+    if valid.any():
         prob = gamma_dist.cdf(rolling[valid].values, *params)
         prob = np.clip(prob, 0.001, 0.999)
         result[valid.values] = norm.ppf(prob)
-    except Exception:
-        pass
     return pd.Series(result, index=precip_series.index)
 
 
-def compute_spei(precip_series, pet_series, scale=3):
-    # Water balance deficit/surplus — core of SPEI
+def compute_spei(precip_series, pet_series, dates, train_mask, scale=3):
+    """SPEI fitted on training period only, applied everywhere."""
     wb = precip_series - pet_series
     rolling = wb.rolling(scale, min_periods=scale).sum()
     result = np.full(len(rolling), np.nan)
-    valid = rolling.notna()
-    if valid.sum() < 10:
+
+    # We shift by the TRAINING-period minimum so the same offset is applied to
+    # train, val, and test. This is essential — otherwise the shift itself
+    # leaks future info into past samples.
+    train_vals = rolling[train_mask & rolling.notna()].values
+    if len(train_vals) < 30:
         return pd.Series(result, index=precip_series.index)
+
+    train_min = train_vals.min()
+    shift = -train_min + 0.001  # makes train values strictly positive
+
     try:
-        # Shift to positive range for gamma fitting
-        shifted = rolling[valid] - rolling[valid].min() + 0.001
-        params = gamma_dist.fit(shifted.values, floc=0)
-        prob = gamma_dist.cdf(shifted.values, *params)
+        params = gamma_dist.fit(train_vals + shift, floc=0)
+    except Exception:
+        return pd.Series(result, index=precip_series.index)
+
+    valid = rolling.notna()
+    if valid.any():
+        shifted_full = rolling[valid].values + shift
+        # Guard: any test value below train minimum would go negative — clip
+        shifted_full = np.maximum(shifted_full, 1e-6)
+        prob = gamma_dist.cdf(shifted_full, *params)
         prob = np.clip(prob, 0.001, 0.999)
         result[valid.values] = norm.ppf(prob)
-    except Exception:
-        pass
     return pd.Series(result, index=precip_series.index)
 
 
-df["spi_3month"] = compute_spi(df["precip_mm_day"], scale=3)
-df["spei_3month"] = compute_spei(df["precip_mm_day"], df["pet_mm_day"], scale=3)
+train_mask = df["date"] <= TRAIN_END_FOR_FIT
+print(
+    f"  SPI/SPEI fitted on training period only "
+    f"({train_mask.sum()} days ≤ {TRAIN_END_FOR_FIT.date()})"
+)
 
-# Fill the first 2 rows (insufficient rolling window) with 0
+df["spi_3month"] = compute_spi(df["precip_mm_day"], df["date"], train_mask, scale=3)
+df["spei_3month"] = compute_spei(
+    df["precip_mm_day"], df["pet_mm_day"], df["date"], train_mask, scale=3
+)
+
 df["spi_3month"] = df["spi_3month"].fillna(0.0)
 df["spei_3month"] = df["spei_3month"].fillna(0.0)
 
-# ── Flood exceedance index ─────────────────────────────────────────────────────
-# Binary flag: 1 when discharge exceeds the 90th percentile of the training
-# period (2000–2017). Captures high-flow / flood conditions explicitly.
-# We use the full series percentile as a proxy since training split
-# is not yet defined here — will be recalculated in split.py if needed.
-q90 = df["discharge_m3s"].quantile(0.90)
-df["flood_index"] = (df["discharge_m3s"] > q90).astype(float)
-df["flood_index"] = df["flood_index"].fillna(0.0)
-
-print(f"  Drought/flood indices computed:")
-print(
-    f"    SPI-3  : mean={df['spi_3month'].mean():.3f}  "
-    f"min={df['spi_3month'].min():.2f}  max={df['spi_3month'].max():.2f}"
-)
-print(
-    f"    SPEI-3 : mean={df['spei_3month'].mean():.3f}  "
-    f"min={df['spei_3month'].min():.2f}  max={df['spei_3month'].max():.2f}"
-)
-print(
-    f"    Flood days (Q > Q90={q90:.3f} m³/s): "
-    f"{df['flood_index'].sum():.0f} days "
-    f"({df['flood_index'].mean() * 100:.1f}%)"
-)
-
-# Cyclical month encoding — avoids discontinuity between December and January
+# ── Cyclical month encoding ────────────────────────────────────────────────────
 df["month"] = df["date"].dt.month
 df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
 df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
@@ -496,12 +491,18 @@ df["season"] = df["month"].map(
     }
 )
 
-# ── Final column order ─────────────────────────────────────────────────────────
+# ── Final column order — 18 features + target ─────────────────────────────────
+# NOTE: flood_index removed to prevent data leakage (was computed using full-period Q90)
 cols = [
     "date",
     "precip_mm_day",
     "precip_3day",
     "precip_7day",
+    "precip_lag1",  # NEW
+    "precip_lag2",  # NEW
+    "precip_lag3",  # NEW
+    "precip_lag5",  # NEW
+    "api_15d",  # NEW
     "temp_mean_c",
     "temp_max_c",
     "temp_min_c",
@@ -515,14 +516,40 @@ cols = [
     "sm_7day_mean",
     "sm_anomaly",
     "pet_mm_day",
-    # drought and flood indices  ← new
     "spi_3month",
     "spei_3month",
-    "flood_index",
     "discharge_m3s",
     "month",
     "season",
 ]
+feature_cols_check = [
+    "precip_mm_day",
+    "precip_3day",
+    "precip_7day",
+    "precip_lag1",
+    "precip_lag2",
+    "precip_lag3",
+    "precip_lag5",
+    "api_15d",
+    "temp_mean_c",
+    "temp_max_c",
+    "temp_min_c",
+    "temp_range_c",
+    "swe_mm",
+    "swe_delta",
+    "snow_cover_pct",
+    "month_sin",
+    "month_cos",
+    "soil_moisture_mm",
+    "sm_7day_mean",
+    "sm_anomaly",
+    "pet_mm_day",
+    "spi_3month",
+    "spei_3month",
+]
+nan_report = df[feature_cols_check].isna().sum()
+bad = nan_report[nan_report > 0]
+assert bad.empty, f"NaN remaining in features after preprocessing:\n{bad}"
 df = df[cols]
 
 df_model = df.dropna(subset=["discharge_m3s"]).reset_index(drop=True)
@@ -534,7 +561,7 @@ df_model.to_csv(MASTER / "nahr_ibrahim_master_model.csv", index=False)
 print(f"\n{'=' * 60}")
 print(f"  Period  : {df.date.min().date()} → {df.date.max().date()}")
 print(f"  Full    : {len(df):,} days  |  Model: {len(df_model):,} days")
-print(f"  Features: 19")
+print(f"  Features: 23")
 print(f"\n  Missing values:")
 check = [
     "precip_mm_day",
@@ -555,7 +582,6 @@ check = [
     "pet_mm_day",
     "spi_3month",
     "spei_3month",
-    "flood_index",
     "discharge_m3s",
 ]
 for col in check:

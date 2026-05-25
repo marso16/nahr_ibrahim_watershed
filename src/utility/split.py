@@ -1,10 +1,13 @@
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-ROOT = Path("C:/Users/marck/Downloads/nahr_ibrahim_watershed")
+ROOT = Path(
+    os.environ.get("WATERSHED_ROOT", "C:/Users/marck/Downloads/nahr_ibrahim_watershed")
+)
 MASTER = ROOT / "data" / "master"
 SPLIT_DIR = ROOT / "data" / "splits"
 FIG_DIR = ROOT / "results" / "figures"
@@ -13,8 +16,6 @@ SPLIT_DIR.mkdir(parents=True, exist_ok=True)
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Load master dataset ────────────────────────────────────────────────────────
-# We use the model version (rows with valid discharge) rather than the full
-# dataset so the split sizes reflect actual usable training samples.
 df = pd.read_csv(MASTER / "nahr_ibrahim_master_model.csv", parse_dates=["date"])
 df = df.sort_values("date").reset_index(drop=True)
 
@@ -24,8 +25,6 @@ print(
 )
 
 # ── Chronological split ────────────────────────────────────────────────────────
-# No shuffling — time series must stay in order to avoid data leakage.
-# Boundaries chosen to give roughly 70/11/19% and keep whole years together.
 TRAIN_END = "2017-12-31"
 VAL_END = "2020-12-31"
 
@@ -43,8 +42,6 @@ print("-" * 52)
 print(f"{'Total':<12} {'':<24} {total:>6}  100.0%\n")
 
 # ── Per-split statistics ───────────────────────────────────────────────────────
-# Useful to spot distribution shift between train and test — a non-stationary
-# series is the core motivation for climate-resilient modelling.
 stats_cols = [
     "precip_mm_day",
     "temp_mean_c",
@@ -63,13 +60,16 @@ for col in stats_cols:
             f"{val[col].mean():>10.3f} {test[col].mean():>10.3f}"
         )
 
-# ── Feature list ───────────────────────────────────────────────────────────────
-# 18 features in the exact order the models expect.
-# Indices 12–15 are the four new additions over the original 12.
+# ── Feature list — 18 features (matches preprocess.py) ───────────────────────
 FEATURE_COLS = [
     "precip_mm_day",
     "precip_3day",
     "precip_7day",
+    "precip_lag1",  # NEW
+    "precip_lag2",  # NEW
+    "precip_lag3",  # NEW
+    "precip_lag5",  # NEW
+    "api_15d",  # NEW
     "temp_mean_c",
     "temp_max_c",
     "temp_min_c",
@@ -87,23 +87,41 @@ FEATURE_COLS = [
     "spei_3month",
 ]
 TARGET = "discharge_m3s"
-NEW = {"soil_moisture_mm", "sm_7day_mean", "sm_anomaly", "pet_mm_day"}
 
 print(f"\nFeatures ({len(FEATURE_COLS)}):")
 for i, col in enumerate(FEATURE_COLS):
-    tag = "  ← new" if col in NEW else ""
-    print(f"  [{i:>2}] {col}{tag}")
+    print(f"  [{i:>2}] {col}")
 
 # ── Min-max normalisation ──────────────────────────────────────────────────────
-# Scaler fitted on the training set only — applying it to val/test simulates
-# the real deployment scenario where future statistics are unknown.
+LOG_TRANSFORM_Q = os.environ.get("LOG_TRANSFORM_Q", "1") == "1"
+LOG_EPS = 1e-3
+
+train_q_raw = train[TARGET].copy()
+val_q_raw = val[TARGET].copy()
+test_q_raw = test[TARGET].copy()
+
+if LOG_TRANSFORM_Q:
+    print(f"\nLog-transforming target: y' = log(Q + {LOG_EPS})")
+    for s in [train, val, test]:
+        s[TARGET] = np.log(s[TARGET].clip(lower=0) + LOG_EPS)
+else:
+    print("\nUsing raw discharge as target (no log-transform)")
+
 all_cols = FEATURE_COLS + [TARGET]
 train_min = train[all_cols].min()
 train_max = train[all_cols].max()
 
 scaler = pd.DataFrame({"min": train_min, "max": train_max})
+# Record the transform so downstream code (lstm.py) can invert it correctly.
+import json
+
+with open(SPLIT_DIR / "scaler_meta.json", "w") as f:
+    json.dump(
+        {"log_transform": bool(LOG_TRANSFORM_Q), "log_eps": float(LOG_EPS)}, f, indent=2
+    )
 scaler.to_csv(SPLIT_DIR / "scaler_params.csv")
-print(f"\nScaler saved → data/splits/scaler_params.csv")
+print(f"Scaler saved → data/splits/scaler_params.csv")
+print(f"  (log_transform={LOG_TRANSFORM_Q}, log_eps={LOG_EPS})")
 
 
 def normalise(df_in, cols, lo, hi):
@@ -118,7 +136,6 @@ train_norm = normalise(train, all_cols, train_min, train_max)
 val_norm = normalise(val, all_cols, train_min, train_max)
 test_norm = normalise(test, all_cols, train_min, train_max)
 
-# Report out-of-range values — expected for val/test under climate shift
 val_oob = ((val_norm[FEATURE_COLS] < 0) | (val_norm[FEATURE_COLS] > 1)).sum().sum()
 test_oob = ((test_norm[FEATURE_COLS] < 0) | (test_norm[FEATURE_COLS] > 1)).sum().sum()
 print(f"Out-of-range values: Val={val_oob}  Test={test_oob}")
@@ -143,13 +160,12 @@ print(f"  data/splits/scaler_params.csv")
 # ── Visualisation ──────────────────────────────────────────────────────────────
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 8))
 
-# time series coloured by split
-for s, color, label in [
-    (train, "steelblue", "Train (2000–2017)"),
-    (val, "orange", "Validation (2018–2020)"),
-    (test, "tomato", "Test (2021–2025)"),
+for s, q_raw, color, label in [
+    (train, train_q_raw, "steelblue", "Train (2000–2017)"),
+    (val, val_q_raw, "orange", "Validation (2018–2020)"),
+    (test, test_q_raw, "tomato", "Test (2021–2025)"),
 ]:
-    ax1.fill_between(s.date, s.discharge_m3s, alpha=0.5, color=color, label=label)
+    ax1.fill_between(s.date, q_raw, alpha=0.5, color=color, label=label)
 
 ax1.axvline(pd.Timestamp(TRAIN_END), color="orange", linestyle="--", linewidth=1.5)
 ax1.axvline(pd.Timestamp(VAL_END), color="tomato", linestyle="--", linewidth=1.5)
@@ -158,9 +174,8 @@ ax1.set_ylabel("Discharge (m³/s)")
 ax1.legend(loc="upper right")
 ax1.grid(alpha=0.3)
 
-# distribution comparison
 bp = ax2.boxplot(
-    [train.discharge_m3s.values, val.discharge_m3s.values, test.discharge_m3s.values],
+    [train_q_raw.values, val_q_raw.values, test_q_raw.values],
     patch_artist=True,
     widths=0.5,
     tick_labels=["Train\n2000–2017", "Validation\n2018–2020", "Test\n2021–2025"],
@@ -175,5 +190,5 @@ ax2.grid(axis="y", alpha=0.3)
 
 plt.tight_layout()
 plt.savefig(FIG_DIR / "train_val_test_split.png", dpi=150, bbox_inches="tight")
-plt.show()
+plt.close()
 print(f"\nFigure saved → results/figures/train_val_test_split.png")
