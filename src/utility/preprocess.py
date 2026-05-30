@@ -14,6 +14,7 @@ from rasterio.mask import mask as rio_mask
 from shapely.geometry import mapping
 from pathlib import Path
 from tqdm import tqdm
+from scipy.stats import norm, gamma as gamma_dist
 
 logging.getLogger("cfgrib").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore")
@@ -307,6 +308,8 @@ print("[7/7] Building master dataset ...")
 (MASTER / "nahr_ibrahim_master_full.csv").unlink(missing_ok=True)
 (MASTER / "nahr_ibrahim_master_model.csv").unlink(missing_ok=True)
 
+TRAIN_END_FOR_FIT = pd.Timestamp("2017-12-31")
+
 idx = pd.DataFrame({"date": pd.date_range(START, END, freq="D")})
 
 p = pd.read_csv(PROCESSED / "precip_chirps_daily.csv", parse_dates=["date"])
@@ -328,9 +331,19 @@ df = (
 # ── Gap filling ────────────────────────────────────────────────────────────────
 df["month"] = df["date"].dt.month
 
+# df["snow_cover_pct"] = df["snow_cover_pct"].interpolate(method="linear", limit=5)
+# monthly_snow = df.groupby("month")["snow_cover_pct"].transform("mean")
+# df["snow_cover_pct"] = df["snow_cover_pct"].fillna(monthly_snow)
+
 df["snow_cover_pct"] = df["snow_cover_pct"].interpolate(method="linear", limit=5)
-monthly_snow = df.groupby("month")["snow_cover_pct"].transform("mean")
-df["snow_cover_pct"] = df["snow_cover_pct"].fillna(monthly_snow)
+
+# Train-only monthly means (no leakage)
+train_only = df[df["date"] <= TRAIN_END_FOR_FIT]
+snow_monthly_train = train_only.groupby("month")["snow_cover_pct"].mean()
+# Map train monthly means to every row's month
+df["snow_cover_pct"] = df["snow_cover_pct"].fillna(df["month"].map(snow_monthly_train))
+# Final fallback: train-period grand mean (in case a month had no training data)
+df["snow_cover_pct"] = df["snow_cover_pct"].fillna(train_only["snow_cover_pct"].mean())
 
 df["swe_mm"] = df["swe_mm"].interpolate(method="linear", limit=3).fillna(0.0)
 
@@ -338,7 +351,10 @@ df["soil_moisture_mm"] = df["soil_moisture_mm"].interpolate(method="linear", lim
 df["soil_moisture_mm"] = df["soil_moisture_mm"].fillna(
     df["soil_moisture_mm"].rolling(30, min_periods=5).mean()
 )
-df["soil_moisture_mm"] = df["soil_moisture_mm"].fillna(df["soil_moisture_mm"].mean())
+# df["soil_moisture_mm"] = df["soil_moisture_mm"].fillna(df["soil_moisture_mm"].mean())
+
+sm_train_mean = df.loc[df["date"] <= TRAIN_END_FOR_FIT, "soil_moisture_mm"].mean()
+df["soil_moisture_mm"] = df["soil_moisture_mm"].fillna(sm_train_mean)
 
 for col in ["temp_mean_c", "temp_max_c", "temp_min_c"]:
     df[col] = df[col].interpolate(method="linear", limit=3)
@@ -400,60 +416,60 @@ from scipy.stats import norm, gamma as gamma_dist
 TRAIN_END_FOR_FIT = pd.Timestamp("2017-12-31")  # KEEP IN SYNC with split.py
 
 
-def compute_spi(precip_series, dates, train_mask, scale=3):
-    """SPI fitted on training period only, applied everywhere."""
-    rolling = precip_series.rolling(scale, min_periods=scale).sum()
-    result = np.full(len(rolling), np.nan)
+# def compute_spi(precip_series, dates, train_mask, scale=3):
+#     """SPI fitted on training period only, applied everywhere."""
+#     rolling = precip_series.rolling(scale, min_periods=scale).sum()
+#     result = np.full(len(rolling), np.nan)
 
-    # Fit gamma on training-period rolling values only
-    train_vals = rolling[train_mask & rolling.notna() & (rolling > 0)].values
-    if len(train_vals) < 30:
-        # Not enough training data to fit
-        return pd.Series(result, index=precip_series.index)
-    try:
-        params = gamma_dist.fit(train_vals, floc=0)
-    except Exception:
-        return pd.Series(result, index=precip_series.index)
+#     # Fit gamma on training-period rolling values only
+#     train_vals = rolling[train_mask & rolling.notna() & (rolling > 0)].values
+#     if len(train_vals) < 30:
+#         # Not enough training data to fit
+#         return pd.Series(result, index=precip_series.index)
+#     try:
+#         params = gamma_dist.fit(train_vals, floc=0)
+#     except Exception:
+#         return pd.Series(result, index=precip_series.index)
 
-    # Apply fitted params to ENTIRE series
-    valid = rolling.notna() & (rolling > 0)
-    if valid.any():
-        prob = gamma_dist.cdf(rolling[valid].values, *params)
-        prob = np.clip(prob, 0.001, 0.999)
-        result[valid.values] = norm.ppf(prob)
-    return pd.Series(result, index=precip_series.index)
+#     # Apply fitted params to ENTIRE series
+#     valid = rolling.notna() & (rolling > 0)
+#     if valid.any():
+#         prob = gamma_dist.cdf(rolling[valid].values, *params)
+#         prob = np.clip(prob, 0.001, 0.999)
+#         result[valid.values] = norm.ppf(prob)
+#     return pd.Series(result, index=precip_series.index)
 
 
-def compute_spei(precip_series, pet_series, dates, train_mask, scale=3):
-    """SPEI fitted on training period only, applied everywhere."""
-    wb = precip_series - pet_series
-    rolling = wb.rolling(scale, min_periods=scale).sum()
-    result = np.full(len(rolling), np.nan)
+# def compute_spei(precip_series, pet_series, dates, train_mask, scale=3):
+#     """SPEI fitted on training period only, applied everywhere."""
+#     wb = precip_series - pet_series
+#     rolling = wb.rolling(scale, min_periods=scale).sum()
+#     result = np.full(len(rolling), np.nan)
 
-    # We shift by the TRAINING-period minimum so the same offset is applied to
-    # train, val, and test. This is essential — otherwise the shift itself
-    # leaks future info into past samples.
-    train_vals = rolling[train_mask & rolling.notna()].values
-    if len(train_vals) < 30:
-        return pd.Series(result, index=precip_series.index)
+#     # We shift by the TRAINING-period minimum so the same offset is applied to
+#     # train, val, and test. This is essential — otherwise the shift itself
+#     # leaks future info into past samples.
+#     train_vals = rolling[train_mask & rolling.notna()].values
+#     if len(train_vals) < 30:
+#         return pd.Series(result, index=precip_series.index)
 
-    train_min = train_vals.min()
-    shift = -train_min + 0.001  # makes train values strictly positive
+#     train_min = train_vals.min()
+#     shift = -train_min + 0.001  # makes train values strictly positive
 
-    try:
-        params = gamma_dist.fit(train_vals + shift, floc=0)
-    except Exception:
-        return pd.Series(result, index=precip_series.index)
+#     try:
+#         params = gamma_dist.fit(train_vals + shift, floc=0)
+#     except Exception:
+#         return pd.Series(result, index=precip_series.index)
 
-    valid = rolling.notna()
-    if valid.any():
-        shifted_full = rolling[valid].values + shift
-        # Guard: any test value below train minimum would go negative — clip
-        shifted_full = np.maximum(shifted_full, 1e-6)
-        prob = gamma_dist.cdf(shifted_full, *params)
-        prob = np.clip(prob, 0.001, 0.999)
-        result[valid.values] = norm.ppf(prob)
-    return pd.Series(result, index=precip_series.index)
+#     valid = rolling.notna()
+#     if valid.any():
+#         shifted_full = rolling[valid].values + shift
+#         # Guard: any test value below train minimum would go negative — clip
+#         shifted_full = np.maximum(shifted_full, 1e-6)
+#         prob = gamma_dist.cdf(shifted_full, *params)
+#         prob = np.clip(prob, 0.001, 0.999)
+#         result[valid.values] = norm.ppf(prob)
+#     return pd.Series(result, index=precip_series.index)
 
 
 train_mask = df["date"] <= TRAIN_END_FOR_FIT
@@ -462,13 +478,95 @@ print(
     f"({train_mask.sum()} days ≤ {TRAIN_END_FOR_FIT.date()})"
 )
 
-df["spi_3month"] = compute_spi(df["precip_mm_day"], df["date"], train_mask, scale=3)
-df["spei_3month"] = compute_spei(
-    df["precip_mm_day"], df["pet_mm_day"], df["date"], train_mask, scale=3
+# df["spi_3month"] = compute_spi(df["precip_mm_day"], df["date"], train_mask, scale=3)
+# df["spei_3month"] = compute_spei(
+#     df["precip_mm_day"], df["pet_mm_day"], df["date"], train_mask, scale=3
+# )
+
+# df["spi_3month"] = df["spi_3month"].fillna(0.0)
+# df["spei_3month"] = df["spei_3month"].fillna(0.0)
+
+
+def compute_spi_proper(precip_series, train_mask, scale_days=90):
+    """
+    Standardized Precipitation Index.
+
+    - scale_days = window length (90 for 3-month equivalent on daily data)
+    - Gamma fitted on TRAIN values > 0 only (no leakage)
+    - Zero-rainfall probability handled via mixed distribution
+    - Dry periods get correct negative SPI values (not 0)
+    """
+    rolling = precip_series.rolling(scale_days, min_periods=scale_days).sum()
+
+    # Training values for fitting the gamma
+    train_rolling = rolling[train_mask]
+    train_positive = train_rolling[train_rolling > 0].dropna().values
+    if len(train_positive) < 30:
+        return pd.Series(np.full(len(rolling), np.nan), index=precip_series.index)
+
+    # Probability of zero rainfall in training (mixed distribution)
+    n_train_total = train_rolling.dropna().shape[0]
+    p_zero = (n_train_total - len(train_positive)) / max(n_train_total, 1)
+
+    # Fit gamma to positive training values
+    try:
+        params = gamma_dist.fit(train_positive, floc=0)
+    except Exception:
+        return pd.Series(np.full(len(rolling), np.nan), index=precip_series.index)
+
+    # Apply to the full series using the mixed distribution
+    result = np.full(len(rolling), np.nan)
+    not_nan = rolling.notna()
+    vals = rolling[not_nan].values
+
+    # Mixed CDF: P(X <= x) = p_zero + (1 - p_zero) * Gamma_cdf(x)
+    cdf = np.where(
+        vals > 0,
+        p_zero + (1 - p_zero) * gamma_dist.cdf(vals, *params),
+        p_zero / 2.0,  # tied zeros placed at midpoint of zero-mass
+    )
+    cdf = np.clip(cdf, 0.001, 0.999)
+    result[not_nan.values] = norm.ppf(cdf)
+    return pd.Series(result, index=precip_series.index)
+
+
+def compute_spei_proper(precip_series, pet_series, train_mask, scale_days=90):
+    """SPEI on (P - PET) rolling sums. Uses normal distribution since (P-PET)
+    can be negative — fitted on train only."""
+    wb = (precip_series - pet_series).rolling(scale_days, min_periods=scale_days).sum()
+
+    train_vals = wb[train_mask].dropna().values
+    if len(train_vals) < 30:
+        return pd.Series(np.full(len(wb), np.nan), index=precip_series.index)
+
+    mu = train_vals.mean()
+    sigma = train_vals.std()
+    if sigma < 1e-8:
+        return pd.Series(np.full(len(wb), np.nan), index=precip_series.index)
+
+    result = np.full(len(wb), np.nan)
+    not_nan = wb.notna()
+    result[not_nan.values] = (wb[not_nan].values - mu) / sigma
+    return pd.Series(result, index=precip_series.index)
+
+
+train_mask = df["date"] <= TRAIN_END_FOR_FIT
+print(
+    f"  SPI/SPEI fitted on training period only "
+    f"({train_mask.sum()} days <= {TRAIN_END_FOR_FIT.date()})"
 )
 
-df["spi_3month"] = df["spi_3month"].fillna(0.0)
-df["spei_3month"] = df["spei_3month"].fillna(0.0)
+# 3-month equivalent (90-day window) - this is the standard hydrological choice
+df["spi_3month"] = compute_spi_proper(df["precip_mm_day"], train_mask, scale_days=90)
+df["spei_3month"] = compute_spei_proper(
+    df["precip_mm_day"], df["pet_mm_day"], train_mask, scale_days=90
+)
+
+# For the first 89 days of the record (before the 90-day window is full),
+# carry the first valid value backward. This is a defensible warmup handling
+# that doesn't introduce leakage and doesn't destroy the drought signal.
+df["spi_3month"] = df["spi_3month"].bfill().fillna(0.0)
+df["spei_3month"] = df["spei_3month"].bfill().fillna(0.0)
 
 # ── Cyclical month encoding ────────────────────────────────────────────────────
 df["month"] = df["date"].dt.month

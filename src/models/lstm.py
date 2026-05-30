@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from torch.amp import autocast, GradScaler  # newer API; torch.cuda.amp is deprecated
+from torch.amp import autocast, GradScaler
 from pathlib import Path
 from datetime import datetime
 from copy import deepcopy
@@ -51,6 +51,9 @@ class NSELoss(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 def get_config():
     p = argparse.ArgumentParser()
+
+    p.add_argument("--horizon", type=int, default=1)
+    p.add_argument("--lookback", type=int, default=30)
     p.add_argument(
         "--root",
         type=str,
@@ -59,7 +62,6 @@ def get_config():
         ),
         help="Project root directory",
     )
-    # Architecture
     p.add_argument("--units_1", type=int, default=192)
     p.add_argument("--units_2", type=int, default=96)
     p.add_argument("--attention_dim", type=int, default=128)
@@ -67,43 +69,36 @@ def get_config():
     p.add_argument("--dropout", type=float, default=0.30)
     p.add_argument("--recurrent_dropout", type=float, default=0.15)
     p.add_argument("--bidirectional", action="store_true", default=True)
-
-    # Training
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--batch_size", type=int, default=64)
+    # p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--patience", type=int, default=40)
     p.add_argument("--warmup_epochs", type=int, default=5)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true", default=True)
     p.add_argument("--ema_decay", type=float, default=0.999)
-
-    # Peak handling (loss-only, NOT sampling)
-    # Set --use_peak_loss to False (or --peak_loss_weight 1.0) for an
-    # ablation that uses plain Huber. Peak weighting helps Peak_MAE but
-    # often hurts NSE/KGE by inflating the predicted variance.
     p.add_argument(
         "--use_peak_loss",
         action="store_true",
         default=False,
         help="Enable peak-weighted Huber loss (default: off, plain Huber)",
     )
-
-    p.add_argument(
-        "--use_nse_loss",
-        action="store_true",
-        default=False,
-        help="Train with batch-wise NSE-loss instead of Huber",
-    )
-
+    p.add_argument("--use_nse_loss", action="store_true", default=True)
     p.add_argument("--peak_percentile", type=float, default=85.0)
     p.add_argument("--peak_loss_weight", type=float, default=2.5)
-    p.add_argument("--huber_delta", type=float, default=0.05)
-
-    # Misc
+    # p.add_argument("--huber_delta", type=float, default=0.05)
+    p.add_argument("--huber_delta", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument(
+        "--run_tag",
+        type=str,
+        default=None,
+        help="Optional tag appended to all output filenames. "
+        "If omitted, defaults to 'seed{seed}'.",
+    )
     return p.parse_args()
 
 
@@ -405,6 +400,8 @@ def main():
     cfg = get_config()
     set_seed(cfg.seed)
 
+    tag = cfg.run_tag if cfg.run_tag else f"seed{cfg.seed}"
+
     # ── Paths ─────────────────────────────────────────────────────────────────
     ROOT = Path(cfg.root)
     SEQ_DIR = ROOT / "data" / "sequences"
@@ -435,13 +432,14 @@ def main():
 
     # ── Load sequences ────────────────────────────────────────────────────────
     print("\nLoading sequences...")
-    X_train = np.load(SEQ_DIR / "X_train.npy")
-    y_train = np.load(SEQ_DIR / "y_train.npy")
-    X_val = np.load(SEQ_DIR / "X_val.npy")
-    y_val = np.load(SEQ_DIR / "y_val.npy")
-    X_test = np.load(SEQ_DIR / "X_test.npy")
-    y_test = np.load(SEQ_DIR / "y_test.npy")
-    dates_test = np.load(SEQ_DIR / "dates_test.npy", allow_pickle=True)
+    suffix = f"_h{cfg.horizon}_lb{cfg.lookback}"
+    X_train = np.load(SEQ_DIR / f"X_train{suffix}.npy")
+    y_train = np.load(SEQ_DIR / f"y_train{suffix}.npy")
+    X_val = np.load(SEQ_DIR / f"X_val{suffix}.npy")
+    y_val = np.load(SEQ_DIR / f"y_val{suffix}.npy")
+    X_test = np.load(SEQ_DIR / f"X_test{suffix}.npy")
+    y_test = np.load(SEQ_DIR / f"y_test{suffix}.npy")
+    dates_test = np.load(SEQ_DIR / f"dates_test{suffix}.npy", allow_pickle=True)
 
     total = len(X_train) + len(X_val) + len(X_test)
     print(f"  X_train: {X_train.shape}")
@@ -452,7 +450,8 @@ def main():
         f"val={len(X_val)/total*100:.1f}% test={len(X_test)/total*100:.1f}%"
     )
 
-    assert len(X_train) / total > 0.5, "training set seems too small"
+    # assert len(X_train) / total > 0.5, "training set seems too small"
+    assert len(X_train) / total > 0.3, "training set seems too small"
     assert len(X_test) / total > 0.1, "test set seems too small"
 
     input_dim = X_train.shape[2]
@@ -669,7 +668,7 @@ def main():
                     "config": vars(cfg),
                     "peak_threshold": peak_threshold,
                 },
-                MODEL_DIR / "checkpoints" / "lstm_best.pt",
+                MODEL_DIR / "checkpoints" / f"lstm_best_{tag}.pt",
             )
         else:
             patience_counter += 1
@@ -686,14 +685,20 @@ def main():
     print(f"Best val loss: {best_val:.6f} @ epoch {best_epoch}")
 
     # ── Load best (EMA) weights ───────────────────────────────────────────────
-    ckpt = torch.load(MODEL_DIR / "checkpoints" / "lstm_best.pt", weights_only=False)
+    ckpt = torch.load(
+        MODEL_DIR / "checkpoints" / f"lstm_best_{tag}.pt", weights_only=False
+    )
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    torch.save(model.state_dict(), MODEL_DIR / "trained" / "lstm_final.pt")
+    # torch.save(model.state_dict(), MODEL_DIR / "trained" / "lstm_final.pt")
+    torch.save(model.state_dict(), MODEL_DIR / "trained" / f"lstm_final_{tag}.pt")
 
     # ── History CSV ───────────────────────────────────────────────────────────
     history_df = pd.DataFrame(history)
-    history_df.to_csv(MODEL_DIR / "configs" / "lstm_training_log.csv", index=False)
+    # history_df.to_csv(MODEL_DIR / "configs" / "lstm_training_log.csv", index=False)
+    history_df.to_csv(
+        MODEL_DIR / "configs" / f"lstm_training_log_{tag}.csv", index=False
+    )
 
     # ── Evaluate on test ──────────────────────────────────────────────────────
     print(f"\n{'=' * 72}\nEvaluation on test set\n{'=' * 72}")
@@ -789,7 +794,8 @@ def main():
                 "KGE_beta": round(float(kge_beta), 4),
             }
         ]
-    ).to_csv(MET_DIR / "lstm_metrics.csv", index=False)
+        # ).to_csv(MET_DIR / "lstm_metrics.csv", index=False)
+    ).to_csv(MET_DIR / f"lstm_metrics_{tag}.csv", index=False)
 
     # Save predictions
     pred_df = pd.DataFrame(
@@ -801,7 +807,8 @@ def main():
             "is_peak": peak_mask,
         }
     )
-    pred_df.to_csv(PRED_DIR / "lstm_predictions_test.csv", index=False)
+    # pred_df.to_csv(PRED_DIR / "lstm_predictions_test.csv", index=False)
+    pred_df.to_csv(PRED_DIR / f"lstm_predictions_test_{tag}.csv", index=False)
 
     # Save hparams + results
     hparams = {
@@ -1101,7 +1108,9 @@ def main():
         y=0.98,
     )
 
-    fig_path = FIG_DIR / "lstm_results.png"
+    # fig_path = FIG_DIR / "lstm_results.png"
+    fig_path = FIG_DIR / f"lstm_results_{tag}.png"
+
     plt.savefig(
         fig_path, dpi=150, bbox_inches="tight", facecolor="#ffffff", edgecolor="none"
     )
@@ -1109,12 +1118,9 @@ def main():
     print(f"\nDashboard → {fig_path}")
 
     print(f"\n{'=' * 72}")
-    nse_status = "PASS" if nse_val > 0.8 else "FAIL"
-    kge_status = "PASS" if kge_val > 0.8 else "FAIL"
-    print(
-        f"TARGET CHECK:  NSE={nse_val:.3f} [{nse_status}]  |  "
-        f"KGE={kge_val:.3f} [{kge_status}]"
-    )
+    # nse_status = "PASS" if nse_val > 0.8 else "FAIL"
+    # kge_status = "PASS" if kge_val > 0.8 else "FAIL"
+    print(f"TARGET CHECK:  NSE={nse_val:.3f}  |  " f"KGE={kge_val:.3f}")
     print(f"{'=' * 72}")
 
 

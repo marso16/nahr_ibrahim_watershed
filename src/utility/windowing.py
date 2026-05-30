@@ -16,34 +16,87 @@ FIG_DIR = ROOT / "results" / "figures"
 SEQ_DIR.mkdir(parents=True, exist_ok=True)
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-LOOKBACK = 30
-HORIZON = 1  # predict one day ahead
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--horizon", type=int, default=1)
+parser.add_argument("--lookback", type=int, default=30)
+args, _ = parser.parse_known_args()
+
+LOOKBACK = args.lookback
+HORIZON = args.horizon
+print(f"Running with HORIZON={HORIZON}, LOOKBACK={LOOKBACK}")
 
 FEATURE_COLS = [
+    # Precipitation
     "precip_mm_day",
     "precip_3day",
     "precip_7day",
-    "precip_lag1",  # NEW
-    "precip_lag2",  # NEW
-    "precip_lag3",  # NEW
-    "precip_lag5",  # NEW
-    "api_15d",  # NEW
+    "precip_14day",
+    "precip_30day",
+    "precip_60day",
+    "precip_90day",
+    "precip_lag1",
+    "precip_lag2",
+    "precip_lag3",
+    "precip_lag5",
+    "api_15d",
+    "api_30d",
+    "api_60d",
+    # Temperature
     "temp_mean_c",
     "temp_max_c",
     "temp_min_c",
     "temp_range_c",
+    # Snow
     "swe_mm",
     "swe_delta",
     "snow_cover_pct",
-    "month_sin",
-    "month_cos",
+    # Soil moisture
     "soil_moisture_mm",
     "sm_7day_mean",
+    "sm_30day_mean",
     "sm_anomaly",
+    "sm_deep_30day",
+    "sm_deep_anomaly",
+    # Energy / PET
     "pet_mm_day",
+    # Drought
     "spi_3month",
     "spei_3month",
+    # Cyclical
+    "month_sin",
+    "month_cos",
 ]
+
+# FEATURE_COLS = [
+#     "precip_mm_day",
+#     "precip_3day",
+#     "precip_7day",
+#     "precip_lag1",
+#     "precip_lag2",
+#     "precip_lag3",
+#     "precip_lag5",
+#     "api_15d",
+#     "temp_mean_c",
+#     "temp_max_c",
+#     "temp_min_c",
+#     "temp_range_c",
+#     "swe_mm",
+#     "swe_delta",
+#     "snow_cover_pct",
+#     "month_sin",
+#     "month_cos",
+#     "soil_moisture_mm",
+#     "sm_7day_mean",
+#     "sm_anomaly",
+#     "pet_mm_day",
+#     "spi_3month",
+#     "spei_3month",
+#     # "discharge_lag1",
+#     # "discharge_lag2",
+#     # "discharge_lag3",
+# ]
 TARGET = "discharge_m3s"
 
 print(
@@ -111,6 +164,7 @@ for name, X in [("Train", X_train), ("Val", X_val), ("Test", X_test)]:
 print("All integrity checks passed")
 
 # ── Save arrays ───────────────────────────────────────────────────────────────
+suffix = f"_h{HORIZON}_lb{LOOKBACK}"
 for fname, arr in [
     ("X_train", X_train),
     ("y_train", y_train),
@@ -122,7 +176,7 @@ for fname, arr in [
     ("y_test", y_test),
     ("dates_test", dates_test),
 ]:
-    np.save(SEQ_DIR / f"{fname}.npy", arr)
+    np.save(SEQ_DIR / f"{fname}{suffix}.npy", arr)
 
 pd.DataFrame(
     {

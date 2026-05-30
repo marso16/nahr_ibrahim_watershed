@@ -25,6 +25,8 @@ print(
 )
 
 # ── Chronological split ────────────────────────────────────────────────────────
+# TRAIN_END = "2010-12-31"
+# VAL_END   = "2013-12-31"
 TRAIN_END = "2017-12-31"
 VAL_END = "2020-12-31"
 
@@ -60,45 +62,108 @@ for col in stats_cols:
             f"{val[col].mean():>10.3f} {test[col].mean():>10.3f}"
         )
 
-# ── Feature list — 18 features (matches preprocess.py) ───────────────────────
+# ── Add discharge lags (computed on RAW discharge, before any transform) ───────
+# Important: lags are computed per-split to avoid leakage across boundaries.
+# The first 3 rows of val/test will have NaN lags filled with split-local backfill.
+# DISCHARGE_LAG_COLS = ["discharge_lag1", "discharge_lag2", "discharge_lag3"]
+
+# for s in [train, val, test]:
+#     s["discharge_lag1"] = s["discharge_m3s"].shift(1)
+#     s["discharge_lag2"] = s["discharge_m3s"].shift(2)
+#     s["discharge_lag3"] = s["discharge_m3s"].shift(3)
+#     for col in DISCHARGE_LAG_COLS:
+#         s[col] = s[col].fillna(s["discharge_m3s"].iloc[0])
+
+# print(f"\nAdded discharge lag features: {DISCHARGE_LAG_COLS}")
+
+# ── Feature list ───────────────────────────────────────────────────────────────
 FEATURE_COLS = [
+    # Precipitation
     "precip_mm_day",
     "precip_3day",
     "precip_7day",
-    "precip_lag1",  # NEW
-    "precip_lag2",  # NEW
-    "precip_lag3",  # NEW
-    "precip_lag5",  # NEW
-    "api_15d",  # NEW
+    "precip_14day",
+    "precip_30day",
+    "precip_60day",
+    "precip_90day",
+    "precip_lag1",
+    "precip_lag2",
+    "precip_lag3",
+    "precip_lag5",
+    "api_15d",
+    "api_30d",
+    "api_60d",
+    # Temperature
     "temp_mean_c",
     "temp_max_c",
     "temp_min_c",
     "temp_range_c",
+    # Snow
     "swe_mm",
     "swe_delta",
     "snow_cover_pct",
-    "month_sin",
-    "month_cos",
+    # Soil moisture
     "soil_moisture_mm",
     "sm_7day_mean",
+    "sm_30day_mean",
     "sm_anomaly",
+    "sm_deep_30day",
+    "sm_deep_anomaly",
+    # Energy / PET
     "pet_mm_day",
+    # Drought
     "spi_3month",
     "spei_3month",
+    # Cyclical
+    "month_sin",
+    "month_cos",
 ]
+# FEATURE_COLS = [
+#     "precip_mm_day",
+#     "precip_3day",
+#     "precip_7day",
+#     "precip_lag1",
+#     "precip_lag2",
+#     "precip_lag3",
+#     "precip_lag5",
+#     "api_15d",
+#     "temp_mean_c",
+#     "temp_max_c",
+#     "temp_min_c",
+#     "temp_range_c",
+#     "swe_mm",
+#     "swe_delta",
+#     "snow_cover_pct",
+#     "month_sin",
+#     "month_cos",
+#     "soil_moisture_mm",
+#     "sm_7day_mean",
+#     "sm_anomaly",
+#     "pet_mm_day",
+#     "spi_3month",
+#     "spei_3month",
+#     # "discharge_lag1",
+#     # "discharge_lag2",
+#     # "discharge_lag3",
+# ]
 TARGET = "discharge_m3s"
 
 print(f"\nFeatures ({len(FEATURE_COLS)}):")
 for i, col in enumerate(FEATURE_COLS):
     print(f"  [{i:>2}] {col}")
 
-# ── Min-max normalisation ──────────────────────────────────────────────────────
+# ── Log-transform target ───────────────────────────────────────────────────────
 LOG_TRANSFORM_Q = os.environ.get("LOG_TRANSFORM_Q", "1") == "1"
 LOG_EPS = 1e-3
 
 train_q_raw = train[TARGET].copy()
 val_q_raw = val[TARGET].copy()
 test_q_raw = test[TARGET].copy()
+
+# Save raw discharge as a separate column BEFORE any transform.
+# Used by baselines.py and for plotting in real m³/s.
+for s in [train, val, test]:
+    s["discharge_m3s_raw"] = s[TARGET].copy()
 
 if LOG_TRANSFORM_Q:
     print(f"\nLog-transforming target: y' = log(Q + {LOG_EPS})")
@@ -107,21 +172,26 @@ if LOG_TRANSFORM_Q:
 else:
     print("\nUsing raw discharge as target (no log-transform)")
 
+# ── Min-max normalisation (fit on train only) ──────────────────────────────────
 all_cols = FEATURE_COLS + [TARGET]
 train_min = train[all_cols].min()
 train_max = train[all_cols].max()
 
 scaler = pd.DataFrame({"min": train_min, "max": train_max})
-# Record the transform so downstream code (lstm.py) can invert it correctly.
-import json
 
-with open(SPLIT_DIR / "scaler_meta.json", "w") as f:
-    json.dump(
-        {"log_transform": bool(LOG_TRANSFORM_Q), "log_eps": float(LOG_EPS)}, f, indent=2
-    )
+# ── Write __meta__ row so lstm.py can invert the log-transform correctly ───────
+# lstm.py checks:  if "__meta__" in scaler_df.index:
+#                      log_transform = bool(float(scaler_df.loc["__meta__", "min"]))
+#                      log_eps       = float(scaler_df.loc["__meta__", "max"])
+meta_row = pd.DataFrame(
+    {"min": [float(LOG_TRANSFORM_Q)], "max": [float(LOG_EPS)]},
+    index=["__meta__"],
+)
+scaler = pd.concat([scaler, meta_row])
 scaler.to_csv(SPLIT_DIR / "scaler_params.csv")
+
 print(f"Scaler saved → data/splits/scaler_params.csv")
-print(f"  (log_transform={LOG_TRANSFORM_Q}, log_eps={LOG_EPS})")
+print(f"  __meta__ row written: log_transform={LOG_TRANSFORM_Q}, log_eps={LOG_EPS}")
 
 
 def normalise(df_in, cols, lo, hi):

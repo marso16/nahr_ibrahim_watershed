@@ -1,128 +1,76 @@
-import cdsapi
 import os
-import json
-import time
-import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import glob
+import warnings
+import pandas as pd
+import xarray as xr
+from pathlib import Path
+from tqdm import tqdm
 
-# ==================================================
-# CONFIG
-# ==================================================
-DATASET = "cems-glofas-historical"
-OUTPUT_DIR = r"data\raw\glofas"
-STATE_FILE = r"C:\Users\marck\Downloads\nahr_ibrahim_watershed\download_state.json"
-YEARS = range(2000, 2026)
-MONTHS = list(range(1, 13))
-
-MAX_WORKERS = 4
-MAX_RETRIES = 6
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-client = cdsapi.Client()
+# config
+INPUT_DIR = os.path.join("data", "raw", "glofas")
+OUTPUT_FILE = os.path.join(INPUT_DIR, "glofas_discharge.csv")
 
 
-# ==================================================
-# STATE MANAGEMENT
-# ==================================================
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {"done": []}
+def main():
+    grib_files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.grib")))
 
+    if not grib_files:
+        print(f"No .grib files found in {INPUT_DIR}")
+        return
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    print(f"Found {len(grib_files)} .grib files\n")
 
+    all_records = []
 
-state = load_state()
-done_set = set(state["done"])
-
-
-# ==================================================
-# REQUEST BUILDER
-# ==================================================
-def build_request(year, month):
-    return {
-        "system_version": ["version_4_0"],
-        "hydrological_model": ["lisflood"],
-        "product_type": ["consolidated"],
-        "variable": ["river_discharge_in_the_last_24_hours"],
-        "hyear": [str(year)],
-        "hmonth": [f"{month:02d}"],
-        "hday": [f"{d:02d}" for d in range(1, 32)],
-        "download_format": "zip",
-        "area": [34.16, 35.84, 34.02, 35.96],
-    }
-
-
-# ==================================================
-# DOWNLOAD FUNCTION
-# ==================================================
-def download_chunk(year, month):
-    key = f"{year}-{month:02d}"
-    output_file = os.path.join(OUTPUT_DIR, f"glofas_{key}.zip")
-
-    # Skip if already done in state
-    if key in done_set:
-        return f"[SKIP] {key} (state)"
-
-    # Skip if file exists and looks valid
-    if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-        done_set.add(key)
-        return f"[SKIP] {key} (file exists)"
-
-    request = build_request(year, month)
-
-    for attempt in range(1, MAX_RETRIES + 1):
+    for fpath in tqdm(grib_files, desc="Extracting"):
         try:
-            print(f"[START] {key} attempt {attempt}")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ds = xr.open_dataset(fpath, engine="cfgrib")
 
-            client.retrieve(DATASET, request).download(output_file)
+            dis = ds[
+                "dis24"
+            ]  # here the shape of the data is (time, latitude, longitude)
 
-            # mark success
-            done_set.add(key)
-            state["done"] = list(done_set)
-            save_state(state)
+            # for each day we compute mean and max discharge over all grid points
+            for t in range(len(dis.time)):
+                daily = dis.isel(time=t)
+                date = pd.Timestamp(dis.time.values[t]).strftime("%Y-%m-%d")
 
-            return f"[OK] {key}"
+                all_records.append(
+                    {
+                        "date": date,
+                        "dis24_mean": float(
+                            daily.mean()
+                        ),  # mean over grid points (m3/s)
+                        "dis24_max": float(daily.max()),  # max over grid points(m3/s)
+                    }
+                )
+
+            ds.close()
 
         except Exception as e:
-            wait = min(120, (2**attempt) + random.random() * 2)
-            print(f"[RETRY] {key} attempt {attempt} failed: {e}")
-            print(f"         waiting {wait:.1f}s")
+            print(f"\n  X Failed {os.path.basename(fpath)}: {e}")
 
-            time.sleep(wait)
+    if not all_records:
+        print("No data extracted.")
+        return
 
-    return f"[FAILED] {key}"
+    # build d then sort by date and remove duplicates
+    df = pd.DataFrame(all_records)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").drop_duplicates(subset="date").reset_index(drop=True)
+    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
 
+    df.to_csv(OUTPUT_FILE, index=False)
 
-# ==================================================
-# WORK LIST
-# ==================================================
-tasks = [(y, m) for y in YEARS for m in MONTHS if f"{y}-{m:02d}" not in done_set]
-
-
-# ==================================================
-# RUN PARALLEL
-# ==================================================
-def main():
-    print(f"Total remaining chunks: {len(tasks)}")
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(download_chunk, y, m): (y, m) for (y, m) in tasks}
-
-        for f in as_completed(futures):
-            y, m = futures[f]
-            try:
-                result = f.result()
-                print(result)
-            except Exception as e:
-                print(f"[CRASH] {y}-{m:02d}: {e}")
-
-    print("\nDONE")
+    print(f"\n{'='*50}")
+    print(f"Done. {len(df)} daily records extracted.")
+    print(f"Date range : {df['date'].min()} to {df['date'].max()}")
+    print(f"Saved to   : {os.path.abspath(OUTPUT_FILE)}")
+    print(f"{'='*50}")
+    print(f"Sample data :")
+    print(df.head())
 
 
 if __name__ == "__main__":
