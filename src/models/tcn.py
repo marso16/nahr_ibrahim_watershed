@@ -3,6 +3,7 @@ import json
 import time
 import random
 import argparse
+import logging
 import numpy as np
 import pandas as pd
 import torch
@@ -13,7 +14,6 @@ from torch.amp import autocast, GradScaler
 from pathlib import Path
 from datetime import datetime
 from copy import deepcopy
-
 import matplotlib
 
 matplotlib.use("Agg")
@@ -24,6 +24,9 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from scipy import stats
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Loss
+# ═══════════════════════════════════════════════════════════════════════════════
 class NSELoss(nn.Module):
     def __init__(self, eps: float = 1e-6):
         super().__init__()
@@ -40,6 +43,9 @@ class NSELoss(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 def get_config():
     p = argparse.ArgumentParser()
+
+    p.add_argument("--horizon", type=int, default=1)
+    p.add_argument("--lookback", type=int, default=30)
     p.add_argument(
         "--root",
         type=str,
@@ -48,37 +54,57 @@ def get_config():
         ),
         help="Project root directory",
     )
-    # Architecture
-    p.add_argument("--units_1", type=int, default=192)
-    p.add_argument("--units_2", type=int, default=96)
+
+    # TCN architecture
+    p.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=64,
+        help="TCN hidden channels (alias: tcn_base_channels)",
+    )
+    p.add_argument(
+        "--num_layers", type=int, default=3, help="Number of TCN dilated blocks"
+    )
+    p.add_argument(
+        "--tcn_base_channels",
+        type=int,
+        default=None,
+        help="Deprecated alias for --hidden_dim",
+    )
+    p.add_argument(
+        "--tcn_levels", type=int, default=None, help="Deprecated alias for --num_layers"
+    )
+    # p.add_argument(
+    #     "--tcn_base_channels", type=int, default=128, help="Channels per TCN level"
+    # )
+    # p.add_argument(
+    #     "--tcn_levels", type=int, default=3, help="Number of dilated TCN blocks"
+    # )
+    p.add_argument("--kernel_size", type=int, default=3, help="TCN kernel size")
     p.add_argument("--attention_dim", type=int, default=128)
     p.add_argument("--attention_heads", type=int, default=4)
-    p.add_argument("--dropout", type=float, default=0.30)
-    p.add_argument("--recurrent_dropout", type=float, default=0.15)
-    p.add_argument("--bidirectional", action="store_true", default=True)
+    p.add_argument("--dropout", type=float, default=0.20)
 
     # Training
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--lr", type=float, default=0.000125)
+    p.add_argument("--weight_decay", type=float, default=0.000234)
+    p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--epochs", type=int, default=500)
-    p.add_argument("--patience", type=int, default=100)
-    p.add_argument("--warmup_epochs", type=int, default=5)
+    p.add_argument("--patience", type=int, default=60)
+    p.add_argument("--warmup_epochs", type=int, default=10)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true", default=True)
     p.add_argument("--ema_decay", type=float, default=0.999)
+
+    # Loss options
+    p.add_argument("--use_peak_loss", action="store_true", default=False)
+    p.add_argument("--use_nse_loss", action="store_true", default=True)
     p.add_argument("--peak_percentile", type=float, default=85.0)
     p.add_argument("--peak_loss_weight", type=float, default=2.5)
     p.add_argument("--huber_delta", type=float, default=0.15)
-    p.add_argument(
-        "--loss", type=str, default="huber", choices=["huber", "nse", "peak"]
-    )
 
-    # Misc
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--horizon", type=int, default=1)
-    p.add_argument("--lookback", type=int, default=60)
     p.add_argument(
         "--run_tag",
         type=str,
@@ -104,9 +130,105 @@ def set_seed(seed: int):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Model
+# TCN Components
 # ═══════════════════════════════════════════════════════════════════════════════
+class Chomp1d(nn.Module):
+    """Remove the extra padding from the right to preserve causality."""
+
+    def __init__(self, chomp_size):
+        super().__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        return x[:, :, : -self.chomp_size].contiguous()
+
+
+class TemporalBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+
+        self.conv1 = nn.utils.parametrizations.weight_norm(
+            nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                padding=padding,
+                dilation=dilation,
+            )
+        )
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.utils.parametrizations.weight_norm(
+            nn.Conv1d(
+                out_channels,
+                out_channels,
+                kernel_size,
+                padding=padding,
+                dilation=dilation,
+            )
+        )
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(
+            self.conv1,
+            self.chomp1,
+            self.relu1,
+            self.dropout1,
+            self.conv2,
+            self.chomp2,
+            self.relu2,
+            self.dropout2,
+        )
+
+        self.downsample = (
+            nn.Conv1d(in_channels, out_channels, 1)
+            if in_channels != out_channels
+            else None
+        )
+        self.relu = nn.ReLU()
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.net.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+        if self.downsample is not None:
+            nn.init.kaiming_normal_(self.downsample.weight, nonlinearity="relu")
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TCNBackbone(nn.Module):
+    def __init__(self, input_dim, num_channels, kernel_size, dropout):
+        super().__init__()
+        layers = []
+        num_levels = len(num_channels)
+        for i in range(num_levels):
+            in_channels = input_dim if i == 0 else num_channels[i - 1]
+            out_channels = num_channels[i]
+            dilation = 2**i
+            layers.append(
+                TemporalBlock(in_channels, out_channels, kernel_size, dilation, dropout)
+            )
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x: (B, T, F) -> (B, F, T)
+        x = x.transpose(1, 2)
+        return self.network(x)  # (B, C_out, T)
+
+
 class AdditiveAttention(nn.Module):
+    """Bahdanau-style additive attention over a sequence."""
+
     def __init__(self, input_dim: int, attention_dim: int, dropout: float = 0.0):
         super().__init__()
         self.W = nn.Linear(input_dim, attention_dim, bias=True)
@@ -121,64 +243,64 @@ class AdditiveAttention(nn.Module):
         return self.dropout(context), weights.squeeze(-1)
 
 
-class VariationalDropout(nn.Module):
-    def __init__(self, p: float):
-        super().__init__()
-        self.p = p
-
-    def forward(self, x):
-        if not self.training or self.p == 0.0:
-            return x
-        # Same mask across time dimension
-        mask = x.new_empty(x.size(0), 1, x.size(2)).bernoulli_(1 - self.p)
-        return x * mask / (1 - self.p)
-
-
-class WatershedLSTM(nn.Module):
+# class WatershedTCN(nn.Module):
+#     def __init__(
+#         self,
+#         input_dim: int,
+#         tcn_channels: list,
+#         kernel_size: int = 3,
+#         attention_dim: int = 128,
+#         attention_heads: int = 4,
+#         dropout: float = 0.20,
+#     ):
+#         super().__init__()
+class WatershedTCN(nn.Module):
     def __init__(
         self,
-        input_dim: int,
-        units_1: int = 192,
-        units_2: int = 96,
-        attention_dim: int = 128,
-        attention_heads: int = 4,
-        dropout: float = 0.30,
-        recurrent_dropout: float = 0.15,
-        bidirectional: bool = True,
+        input_dim,
+        tcn_channels=None,
+        kernel_size=3,
+        attention_dim=128,
+        attention_heads=4,
+        dropout=0.20,
+        hidden_dim=None,
+        dilations=None,
     ):
+        # Support both tcn_channels (training script) and
+        # hidden_dim+dilations (Optuna script) interfaces
+        if tcn_channels is None:
+            if hidden_dim is not None and dilations is not None:
+                tcn_channels = [hidden_dim] * len(dilations)
+            else:
+                raise ValueError(
+                    "Provide either tcn_channels or both hidden_dim and dilations"
+                )
         super().__init__()
-        self.bidirectional = bidirectional
-        D1 = units_1 * (2 if bidirectional else 1)
-        D2 = units_2 * (2 if bidirectional else 1)
+        self.tcn = TCNBackbone(input_dim, tcn_channels, kernel_size, dropout)
+        out_channels = tcn_channels[-1]
 
-        # Stacked LSTM with variational dropout
-        self.lstm_1 = nn.LSTM(
-            input_dim, units_1, batch_first=True, bidirectional=bidirectional
+        # Additive attention over TCN outputs
+        self.attention = AdditiveAttention(
+            out_channels, attention_dim, dropout=dropout / 2
         )
-        self.var_dropout = VariationalDropout(recurrent_dropout)
-        self.lstm_2 = nn.LSTM(
-            D1, units_2, batch_first=True, bidirectional=bidirectional
-        )
-        self.layer_norm_1 = nn.LayerNorm(D1)
-        self.layer_norm_2 = nn.LayerNorm(D2)
 
-        # Additive attention over LSTM_2 outputs
-        self.attention = AdditiveAttention(D2, attention_dim, dropout=dropout / 2)
-
-        # Multi-head self-attention over LSTM_1 outputs (complementary)
-        self.mha = nn.MultiheadAttention(
-            D1, num_heads=attention_heads, dropout=dropout / 2, batch_first=True
-        )
-        self.mha_norm = nn.LayerNorm(D1)
+        # Multi-head self-attention over TCN outputs
+        # self.mha = nn.MultiheadAttention(
+        #     out_channels,
+        #     num_heads=attention_heads,
+        #     dropout=dropout / 2,
+        #     batch_first=True,
+        # )
+        # self.mha_norm = nn.LayerNorm(out_channels)
 
         # Residual projection from last input timestep
         self.input_residual = nn.Sequential(
-            nn.Linear(input_dim, D2),
+            nn.Linear(input_dim, out_channels),
             nn.SiLU(),
         )
 
         # Fusion: last_step + attention + mha_pool + residual
-        fusion_dim = D2 + D2 + D1 + D2
+        fusion_dim = out_channels * 4
 
         self.head = nn.Sequential(
             nn.LayerNorm(fusion_dim),
@@ -194,44 +316,30 @@ class WatershedLSTM(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        for lstm in [self.lstm_1, self.lstm_2]:
-            for name, param in lstm.named_parameters():
-                if "weight_ih" in name:
-                    nn.init.xavier_uniform_(param)
-                elif "weight_hh" in name:
-                    nn.init.orthogonal_(param)
-                elif "bias" in name:
-                    nn.init.zeros_(param)
-                    # Forget-gate bias = 1 (classic trick)
-                    n = param.size(0)
-                    param.data[n // 4 : n // 2].fill_(1.0)
-        # Dense layers: xavier
-        for module in [self.input_residual, self.head, self.attention]:
-            for m in module.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
         # x: (B, T, F)
-        h1, _ = self.lstm_1(x)
-        h1 = self.layer_norm_1(h1)
-        h1 = self.var_dropout(h1)
+        h = self.tcn(x)  # (B, C, T)
+        h = h.transpose(1, 2)  # (B, T, C)
 
-        h2, _ = self.lstm_2(h1)
-        h2 = self.layer_norm_2(h2)
+        # mha_out, _ = self.mha(h, h, h)
+        # mha_out = self.mha_norm(h + mha_out)
+        mha_pool = h.mean(dim=1)
 
-        # MHA on h1 (residual + norm)
-        mha_out, _ = self.mha(h1, h1, h1)
-        mha_out = self.mha_norm(h1 + mha_out)
-        mha_pool = mha_out.mean(dim=1)
+        # Additive attention on h
+        attn_context, _ = self.attention(h)
 
-        # Additive attention on h2
-        attn_context, _ = self.attention(h2)
-
-        # Last step of h2
-        last_step = h2[:, -1, :]
+        # Last step of h
+        last_step = h[:, -1, :]
 
         # Residual from last input timestep
         residual = self.input_residual(x[:, -1, :])
@@ -380,6 +488,11 @@ def light_style(ax):
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
     cfg = get_config()
+    if cfg.tcn_base_channels is not None:
+        cfg.hidden_dim = cfg.tcn_base_channels
+    if cfg.tcn_levels is not None:
+        cfg.num_layers = cfg.tcn_levels
+
     set_seed(cfg.seed)
 
     tag = cfg.run_tag if cfg.run_tag else f"seed{cfg.seed}"
@@ -422,13 +535,6 @@ def main():
     X_test = np.load(SEQ_DIR / f"X_test{suffix}.npy")
     y_test = np.load(SEQ_DIR / f"y_test{suffix}.npy")
     dates_test = np.load(SEQ_DIR / f"dates_test{suffix}.npy", allow_pickle=True)
-    # X_train = np.load(SEQ_DIR / "X_train.npy")
-    # y_train = np.load(SEQ_DIR / "y_train.npy")
-    # X_val = np.load(SEQ_DIR / "X_val.npy")
-    # y_val = np.load(SEQ_DIR / "y_val.npy")
-    # X_test = np.load(SEQ_DIR / "X_test.npy")
-    # y_test = np.load(SEQ_DIR / "y_test.npy")
-    # dates_test = np.load(SEQ_DIR / "dates_test.npy", allow_pickle=True)
 
     total = len(X_train) + len(X_val) + len(X_test)
     print(f"  X_train: {X_train.shape}")
@@ -439,7 +545,6 @@ def main():
         f"val={len(X_val)/total*100:.1f}% test={len(X_test)/total*100:.1f}%"
     )
 
-    # assert len(X_train) / total > 0.5, "training set seems too small"
     assert len(X_train) / total > 0.3, "training set seems too small"
     assert len(X_test) / total > 0.1, "test set seems too small"
 
@@ -453,7 +558,7 @@ def main():
         f"{peak_threshold:.4f}"
     )
 
-    # ── Dataloaders (NO weighted sampler — single peak mechanism only) ────────
+    # ── Dataloaders ───────────────────────────────────────────────────────────
     train_ds = TensorDataset(
         torch.tensor(X_train, dtype=torch.float32),
         torch.tensor(y_train, dtype=torch.float32).unsqueeze(1),
@@ -492,15 +597,24 @@ def main():
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = WatershedLSTM(
+    # tcn_channels = [cfg.tcn_base_channels] * cfg.tcn_levels
+    # model = WatershedTCN(
+    #     input_dim=input_dim,
+    #     tcn_channels=tcn_channels,
+    #     kernel_size=cfg.kernel_size,
+    #     attention_dim=cfg.attention_dim,
+    #     attention_heads=cfg.attention_heads,
+    #     dropout=cfg.dropout,
+    # ).to(device)
+
+    tcn_channels = [cfg.hidden_dim] * cfg.num_layers
+    model = WatershedTCN(
         input_dim=input_dim,
-        units_1=cfg.units_1,
-        units_2=cfg.units_2,
+        tcn_channels=tcn_channels,
+        kernel_size=cfg.kernel_size,
         attention_dim=cfg.attention_dim,
         attention_heads=cfg.attention_heads,
         dropout=cfg.dropout,
-        recurrent_dropout=cfg.recurrent_dropout,
-        bidirectional=cfg.bidirectional,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -508,10 +622,10 @@ def main():
     print(f"\nModel parameters: {n_params:,} (trainable: {n_trainable:,})")
 
     # Loss, optimizer, scheduler, EMA
-    if cfg.loss == "nse":
+    if cfg.use_nse_loss:
         print(f"  Loss: NSE-loss (batch-wise)")
         criterion = NSELoss().to(device)
-    elif cfg.loss == "peak":
+    elif cfg.use_peak_loss:
         print(f"  Loss: peak-weighted Huber (peak_weight={cfg.peak_loss_weight}×)")
         criterion = PeakFocusedLoss(
             threshold=peak_threshold,
@@ -519,7 +633,7 @@ def main():
             peak_weight=cfg.peak_loss_weight,
         ).to(device)
     else:
-        print(f"  Loss: plain Huber (δ={cfg.huber_delta}) — peak weighting disabled")
+        print(f"  Loss: plain Huber (δ={cfg.huber_delta})")
         criterion = nn.SmoothL1Loss(beta=cfg.huber_delta).to(device)
 
     optimizer = optim.AdamW(
@@ -529,10 +643,13 @@ def main():
         betas=(0.9, 0.999),
     )
 
-    # Linear warmup then ReduceLROnPlateau
     plateau = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=20, min_lr=1e-6
+        optimizer, mode="min", factor=0.5, patience=50, min_lr=1e-6
     )
+
+    # plateau = optim.lr_scheduler.ReduceLROnPlateau(
+    #     optimizer, mode="min", factor=0.5, patience=50, min_lr=1e-6
+    # )
 
     scaler = GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
     ema = ModelEMA(model, decay=cfg.ema_decay)
@@ -541,25 +658,22 @@ def main():
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"\n{'=' * 72}\nTraining run {run_id}\n{'=' * 72}")
     print(
-        f"  Arch: {'Bi' if cfg.bidirectional else ''}LSTM "
-        f"{cfg.units_1} → {cfg.units_2} + AddAttn({cfg.attention_dim}) "
-        f"+ MHA({cfg.attention_heads}h)"
+        f"  Arch: TCN {cfg.hidden_dim}×{cfg.num_layers} (k={cfg.kernel_size}) "
+        f"+ AddAttn({cfg.attention_dim}) + MeanPool"
     )
-    print(
-        f"  Dropout: spatial={cfg.dropout} recurrent={cfg.recurrent_dropout} | "
-        f"WD: {cfg.weight_decay}"
-    )
+    print(f"  Dropout: spatial={cfg.dropout} | WD: {cfg.weight_decay}")
     print(
         f"  LR: {cfg.lr} (warmup={cfg.warmup_epochs}, then ReduceLROnPlateau) | "
         f"Batch: {cfg.batch_size} | EMA: {cfg.ema_decay}"
     )
-    if cfg.loss == "peak":
+    if cfg.use_peak_loss:
         print(
             f"  Loss: Huber(δ={cfg.huber_delta}) with peak weight={cfg.peak_loss_weight}× "
             f"above p{cfg.peak_percentile:.0f}"
         )
     else:
         print(f"  Loss: plain Huber(δ={cfg.huber_delta}) — peak weighting OFF")
+    print(f"  Input: {seq_len}-day lookback × {input_dim} features\n")
 
     history = {
         "epoch": [],
@@ -647,6 +761,7 @@ def main():
             best_val = val_loss
             best_epoch = epoch
             patience_counter = 0
+            # Save EMA weights as the "best" model
             torch.save(
                 {
                     "epoch": epoch,
@@ -655,7 +770,7 @@ def main():
                     "config": vars(cfg),
                     "peak_threshold": peak_threshold,
                 },
-                MODEL_DIR / "checkpoints" / f"lstm_best_{tag}.pt",
+                MODEL_DIR / "checkpoints" / f"tcn_best_{tag}.pt",
             )
         else:
             patience_counter += 1
@@ -673,18 +788,15 @@ def main():
 
     # ── Load best (EMA) weights ───────────────────────────────────────────────
     ckpt = torch.load(
-        MODEL_DIR / "checkpoints" / f"lstm_best_{tag}.pt", weights_only=False
+        MODEL_DIR / "checkpoints" / f"tcn_best_{tag}.pt", weights_only=False
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    # torch.save(model.state_dict(), MODEL_DIR / "trained" / "lstm_final.pt")
-    torch.save(model.state_dict(), MODEL_DIR / "trained" / f"lstm_final_{tag}.pt")
 
     # ── History CSV ───────────────────────────────────────────────────────────
     history_df = pd.DataFrame(history)
-    # history_df.to_csv(MODEL_DIR / "configs" / "lstm_training_log.csv", index=False)
     history_df.to_csv(
-        MODEL_DIR / "configs" / f"lstm_training_log_{tag}.csv", index=False
+        MODEL_DIR / "configs" / f"tcn_training_log_{tag}.csv", index=False
     )
 
     # ── Evaluate on test ──────────────────────────────────────────────────────
@@ -713,16 +825,13 @@ def main():
         log_transform = False
         log_eps = 0.0
 
-    # Step 1: inverse min-max → log-space (or real-space if not log-transformed)
     y_test_lin = y_test * (q_max - q_min) + q_min
     y_pred_lin = y_pred * (q_max - q_min) + q_min
 
-    # Step 2: if log-transform was applied, exp it back
     if log_transform:
         print(f"  Inverting log-transform (eps={log_eps})")
         y_test_real = np.exp(y_test_lin) - log_eps
         y_pred_real = np.exp(y_pred_lin) - log_eps
-        # Clip any tiny negatives from numerical noise
         y_test_real = np.maximum(y_test_real, 0.0)
         y_pred_real = np.maximum(y_pred_real, 0.0)
     else:
@@ -755,8 +864,8 @@ def main():
     print(f"  R²:     {r2:.4f}")
     print(f"  MAE:    {mae_real:.3f} m³/s")
     print(f"  RMSE:   {rmse_real:.3f} m³/s")
-    print(f"  NSE:    {nse_val:.4f}  (target > 0.8)")
-    print(f"  KGE:    {kge_val:.4f}  (target > 0.8)")
+    print(f"  NSE:    {nse_val:.4f}")
+    print(f"  KGE:    {kge_val:.4f}")
     print(f"    r={kge_r:.3f} | α={kge_alpha:.3f} | β={kge_beta:.3f}")
     print(f"  logNSE: {log_nse_val:.4f}")
     print(f"  PBIAS:  {pbias:+.2f}%")
@@ -782,8 +891,7 @@ def main():
                 "KGE_beta": round(float(kge_beta), 4),
             }
         ]
-        # ).to_csv(MET_DIR / "lstm_metrics.csv", index=False)
-    ).to_csv(MET_DIR / f"lstm_metrics_lstm_{tag}.csv", index=False)
+    ).to_csv(MET_DIR / f"tcn_metrics_{tag}.csv", index=False)
 
     # Save predictions
     pred_df = pd.DataFrame(
@@ -795,8 +903,7 @@ def main():
             "is_peak": peak_mask,
         }
     )
-    # pred_df.to_csv(PRED_DIR / "lstm_predictions_test.csv", index=False)
-    pred_df.to_csv(PRED_DIR / f"lstm_predictions_test_{tag}.csv", index=False)
+    pred_df.to_csv(PRED_DIR / f"tcn_predictions_test_{tag}.csv", index=False)
 
     # Save hparams + results
     hparams = {
@@ -821,21 +928,36 @@ def main():
         "kge_alpha": float(kge_alpha),
         "kge_beta": float(kge_beta),
     }
-    with open(LOG_DIR / f"hparams_{run_id}.json", "w") as f:
+    with open(LOG_DIR / f"hparams_tcn_{run_id}.json", "w") as f:
         json.dump(hparams, f, indent=2)
 
-    # ── Plot dashboard ────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(20, 16))
-    fig.patch.set_facecolor("#ffffff")
-    gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.35, wspace=0.3)
+    # ── Individual plots ──────────────────────────────────────────────────────
 
-    # Panel 1: timeseries
-    ax1 = fig.add_subplot(gs[0, :2])
-    light_style(ax1)
-    ax1.plot(
-        pred_df["date"], pred_df["observed"], color="#1f77b4", lw=1.2, label="Observed"
+    def save_fig(fig, name):
+        fig.tight_layout()
+        fig.savefig(
+            FIG_DIR / f"{name}_{tag}.png",
+            dpi=300,
+            bbox_inches="tight",
+            facecolor="#ffffff",
+        )
+        plt.close(fig)
+
+    # ==========================================================================
+    # 1. Time series
+    # ==========================================================================
+    fig, ax = plt.subplots(figsize=(14, 6))
+    light_style(ax)
+
+    ax.plot(
+        pred_df["date"],
+        pred_df["observed"],
+        color="#1f77b4",
+        lw=1.2,
+        label="Observed",
     )
-    ax1.plot(
+
+    ax.plot(
         pred_df["date"],
         pred_df["predicted"],
         color="#ff7f0e",
@@ -843,80 +965,50 @@ def main():
         alpha=0.85,
         label="Predicted",
     )
-    ax1.scatter(
+
+    ax.scatter(
         pred_df.loc[peak_mask, "date"],
         pred_df.loc[peak_mask, "observed"],
         color="#d62728",
         s=15,
         alpha=0.7,
         label="Peaks (p95)",
-        zorder=5,
-    )
-    ax1.fill_between(pred_df["date"], pred_df["observed"], alpha=0.08, color="#1f77b4")
-    ax1.set_ylabel("Discharge (m³/s)")
-    ax1.set_title(
-        f"Forecast — R²={r2:.3f} | NSE={nse_val:.3f} | KGE={kge_val:.3f} | "
-        f"MAE={mae_real:.2f} | Peak MAE={peak_mae:.2f}"
-    )
-    ax1.legend(
-        loc="upper right",
-        facecolor="#ffffff",
-        edgecolor="#cccccc",
-        labelcolor="#333333",
-    )
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
-
-    # Panel 2: metrics box
-    ax2 = fig.add_subplot(gs[0, 2])
-    light_style(ax2)
-    ax2.axis("off")
-    nse_mark = "✓" if nse_val > 0.8 else "✗"
-    kge_mark = "✓" if kge_val > 0.8 else "✗"
-    txt = (
-        f"Test Metrics\n{'─'*22}\n"
-        f"R²:     {r2:.4f}\n"
-        f"NSE:    {nse_val:.4f}  {nse_mark}\n"
-        f"KGE:    {kge_val:.4f}  {kge_mark}\n"
-        f"logNSE: {log_nse_val:.4f}\n"
-        f"{'─'*22}\n"
-        f"MAE:    {mae_real:.3f} m³/s\n"
-        f"RMSE:   {rmse_real:.3f} m³/s\n"
-        f"PBIAS:  {pbias:+.2f}%\n"
-        f"{'─'*22}\n"
-        f"Peak Bias: {peak_bias:+.2f}%\n"
-        f"Peak MAE:  {peak_mae:.2f}\n"
-        f"Peak RMSE: {peak_rmse:.2f}\n"
-        f"{'─'*22}\n"
-        f"KGE breakdown\n"
-        f"  r = {kge_r:.3f}\n"
-        f"  α = {kge_alpha:.3f}\n"
-        f"  β = {kge_beta:.3f}"
-    )
-    ax2.text(
-        0.05,
-        0.95,
-        txt,
-        transform=ax2.transAxes,
-        fontsize=10,
-        fontfamily="monospace",
-        color="#111111",
-        va="top",
-        bbox=dict(
-            boxstyle="round,pad=0.5",
-            facecolor="#f8f9fa",
-            edgecolor="#cccccc",
-            alpha=0.95,
-        ),
     )
 
-    # Panel 3: scatter
-    ax3 = fig.add_subplot(gs[1, 0])
-    light_style(ax3)
-    ax3.scatter(
-        pred_df["observed"], pred_df["predicted"], alpha=0.35, s=12, color="#9467bd"
+    ax.fill_between(
+        pred_df["date"],
+        pred_df["observed"],
+        alpha=0.08,
+        color="#1f77b4",
     )
-    ax3.scatter(
+
+    ax.set_ylabel("Discharge (m³/s)")
+    ax.set_title(
+        f"Forecast — R²={r2:.3f} | NSE={nse_val:.3f} | "
+        f"KGE={kge_val:.3f} | MAE={mae_real:.2f}"
+    )
+
+    ax.legend()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+
+    save_fig(fig, "timeseries")
+
+    # ==========================================================================
+    # 2. Observed vs Predicted Scatter
+    # ==========================================================================
+    fig, ax = plt.subplots(figsize=(7, 6))
+    light_style(ax)
+
+    ax.scatter(
+        pred_df["observed"],
+        pred_df["predicted"],
+        alpha=0.35,
+        s=12,
+        color="#9467bd",
+    )
+
+    ax.scatter(
         pred_df.loc[peak_mask, "observed"],
         pred_df.loc[peak_mask, "predicted"],
         alpha=0.6,
@@ -924,186 +1016,227 @@ def main():
         color="#d62728",
         label="Peaks",
     )
+
     lims = [
         min(pred_df["observed"].min(), pred_df["predicted"].min()),
         max(pred_df["observed"].max(), pred_df["predicted"].max()),
     ]
-    ax3.plot(lims, lims, "--", color="#888888", alpha=0.7, lw=1.2, label="1:1")
-    ax3.set_xlabel("Observed (m³/s)")
-    ax3.set_ylabel("Predicted (m³/s)")
-    ax3.set_title("Observed vs Predicted")
-    ax3.legend(
-        loc="upper left",
-        facecolor="#ffffff",
-        edgecolor="#cccccc",
-        labelcolor="#333333",
-    )
 
-    # Panel 4: residuals time series
-    ax4 = fig.add_subplot(gs[1, 1])
-    light_style(ax4)
-    ax4.axhline(0, color="#888888", lw=0.8, alpha=0.6)
-    ax4.plot(pred_df["date"], pred_df["residual"], color="#d62728", lw=0.7, alpha=0.7)
-    ax4.scatter(
-        pred_df.loc[peak_mask, "date"],
-        pred_df.loc[peak_mask, "residual"],
-        color="#d62728",
-        s=15,
-        alpha=0.8,
-        zorder=5,
-    )
-    ax4.fill_between(
-        pred_df["date"], pred_df["residual"], 0, alpha=0.15, color="#d62728"
-    )
-    ax4.set_ylabel("Residual (m³/s)")
-    ax4.set_title("Residuals (Observed − Predicted)")
-    ax4.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    ax4.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+    ax.plot(lims, lims, "--", color="#888888", label="1:1")
 
-    # Panel 5: residual histogram
-    ax5 = fig.add_subplot(gs[1, 2])
-    light_style(ax5)
-    ax5.hist(
-        pred_df["residual"],
-        bins=60,
-        color="#2ca02c",
-        alpha=0.7,
-        edgecolor="#ffffff",
-        density=True,
-    )
-    ax5.hist(
-        pred_df.loc[peak_mask, "residual"],
-        bins=30,
-        color="#d62728",
-        alpha=0.5,
-        edgecolor="#ffffff",
-        density=True,
-        label="Peak residuals",
-    )
-    ax5.axvline(0, color="#888888", ls="--", lw=1)
-    ax5.set_xlabel("Residual (m³/s)")
-    ax5.set_ylabel("Density")
-    ax5.set_title("Residual Distribution")
-    ax5.legend(
-        loc="upper right",
-        facecolor="#ffffff",
-        edgecolor="#cccccc",
-        labelcolor="#333333",
-    )
+    ax.set_xlabel("Observed (m³/s)")
+    ax.set_ylabel("Predicted (m³/s)")
+    ax.set_title("Observed vs Predicted")
+    ax.legend()
 
-    # Panel 6: peak scatter
-    ax6 = fig.add_subplot(gs[2, 0])
-    light_style(ax6)
+    save_fig(fig, "scatter")
+
+    # ==========================================================================
+    # 3. Residual Time Series
+    # ==========================================================================
+    # fig, ax = plt.subplots(figsize=(14, 5))
+    # light_style(ax)
+
+    # ax.axhline(0, color="#888888", lw=1)
+
+    # ax.plot(
+    #     pred_df["date"],
+    #     pred_df["residual"],
+    #     color="#d62728",
+    #     lw=0.8,
+    # )
+
+    # ax.fill_between(
+    #     pred_df["date"],
+    #     pred_df["residual"],
+    #     0,
+    #     alpha=0.15,
+    #     color="#d62728",
+    # )
+
+    # ax.set_ylabel("Residual (m³/s)")
+    # ax.set_title("Residuals")
+
+    # save_fig(fig, "residual_timeseries")
+
+    # ==========================================================================
+    # 4. Residual Histogram
+    # ==========================================================================
+    # fig, ax = plt.subplots(figsize=(8, 6))
+    # light_style(ax)
+
+    # ax.hist(
+    #     pred_df["residual"],
+    #     bins=60,
+    #     density=True,
+    #     alpha=0.7,
+    #     color="#2ca02c",
+    # )
+
+    # ax.hist(
+    #     pred_df.loc[peak_mask, "residual"],
+    #     bins=30,
+    #     density=True,
+    #     alpha=0.5,
+    #     color="#d62728",
+    #     label="Peak residuals",
+    # )
+
+    # ax.axvline(0, color="#888888", ls="--")
+
+    # ax.set_xlabel("Residual (m³/s)")
+    # ax.set_ylabel("Density")
+    # ax.set_title("Residual Distribution")
+    # ax.legend()
+
+    # save_fig(fig, "residual_histogram")
+
+    # ==========================================================================
+    # 5. Peak Scatter
+    # ==========================================================================
+    fig, ax = plt.subplots(figsize=(7, 6))
+    light_style(ax)
+
     pdf_peak = pred_df[peak_mask]
+
     if len(pdf_peak) > 0:
-        ax6.scatter(
+        ax.scatter(
             pdf_peak["observed"],
             pdf_peak["predicted"],
             alpha=0.6,
             s=25,
             color="#d62728",
         )
-        plims = [pdf_peak["observed"].min() * 0.9, pdf_peak["observed"].max() * 1.05]
-        ax6.plot(plims, plims, "--", color="#888888", alpha=0.7, lw=1.2)
-    ax6.set_xlabel("Observed (m³/s)")
-    ax6.set_ylabel("Predicted (m³/s)")
-    ax6.set_title(f"Peak Flows (p95)\nBias: {peak_bias:+.1f}% | MAE: {peak_mae:.2f}")
 
-    # Panel 7: Q-Q plot
-    ax7 = fig.add_subplot(gs[2, 1])
-    light_style(ax7)
-    stats.probplot(pred_df["residual"], dist="norm", plot=ax7)
-    ax7.get_lines()[0].set_markerfacecolor("#9467bd")
-    ax7.get_lines()[0].set_markersize(4)
-    ax7.get_lines()[0].set_alpha(0.5)
-    ax7.get_lines()[1].set_color("#888888")
-    ax7.set_title("Residual Q-Q Plot (Normality)")
+        plims = [
+            pdf_peak["observed"].min() * 0.9,
+            pdf_peak["observed"].max() * 1.05,
+        ]
 
-    # Panel 8: flow duration curve
-    ax8 = fig.add_subplot(gs[2, 2])
-    light_style(ax8)
+        ax.plot(plims, plims, "--", color="#888888")
+
+    ax.set_xlabel("Observed (m³/s)")
+    ax.set_ylabel("Predicted (m³/s)")
+    ax.set_title(f"Peak Flows (p95)\nBias={peak_bias:+.1f}% | MAE={peak_mae:.2f}")
+
+    save_fig(fig, "peak_scatter")
+
+    # ==========================================================================
+    # 6. Q-Q Plot
+    # ==========================================================================
+    # fig, ax = plt.subplots(figsize=(7, 6))
+    # light_style(ax)
+
+    # stats.probplot(
+    #     pred_df["residual"],
+    #     dist="norm",
+    #     plot=ax,
+    # )
+
+    # ax.set_title("Residual Q-Q Plot")
+
+    # save_fig(fig, "qq_plot")
+
+    # ==========================================================================
+    # 7. Flow Duration Curve
+    # ==========================================================================
+    fig, ax = plt.subplots(figsize=(8, 6))
+    light_style(ax)
+
     obs_s = np.sort(pred_df["observed"].values)[::-1]
     sim_s = np.sort(pred_df["predicted"].values)[::-1]
+
     exc_o = np.arange(1, len(obs_s) + 1) / len(obs_s) * 100
     exc_s = np.arange(1, len(sim_s) + 1) / len(sim_s) * 100
-    ax8.semilogy(
-        exc_o, np.maximum(obs_s, 1e-3), color="#1f77b4", lw=1.5, label="Observed"
-    )
-    ax8.semilogy(
-        exc_s, np.maximum(sim_s, 1e-3), color="#ff7f0e", lw=1.5, label="Predicted"
-    )
-    ax8.set_xlabel("Exceedance Probability (%)")
-    ax8.set_ylabel("Discharge (m³/s)")
-    ax8.set_title("Flow Duration Curve")
-    ax8.legend(
-        loc="upper right",
-        facecolor="#ffffff",
-        edgecolor="#cccccc",
-        labelcolor="#333333",
+
+    ax.semilogy(
+        exc_o,
+        np.maximum(obs_s, 1e-3),
+        label="Observed",
     )
 
-    # Panel 9: training history
-    ax9 = fig.add_subplot(gs[3, :])
-    light_style(ax9)
-    ax9.plot(
+    ax.semilogy(
+        exc_s,
+        np.maximum(sim_s, 1e-3),
+        label="Predicted",
+    )
+
+    ax.set_xlabel("Exceedance Probability (%)")
+    ax.set_ylabel("Discharge (m³/s)")
+    ax.set_title("Flow Duration Curve")
+    ax.legend()
+
+    save_fig(fig, "flow_duration_curve")
+
+    # ==========================================================================
+    # 8. Training History
+    # ==========================================================================
+    fig, ax = plt.subplots(figsize=(10, 6))
+    light_style(ax)
+
+    ax.plot(
         history_df["epoch"],
         history_df["train_loss"],
-        color="#1f77b4",
-        lw=1.5,
         label="Train loss",
     )
-    ax9.plot(
+
+    ax.plot(
         history_df["epoch"],
         history_df["val_loss"],
-        color="#ff7f0e",
-        lw=1.5,
-        label="Val loss (EMA)",
+        label="Val loss",
     )
-    ax9.plot(
+
+    ax.plot(
         history_df["epoch"],
         history_df["val_mae_ema"],
-        color="#2ca02c",
-        lw=1.0,
-        alpha=0.7,
-        label="Val MAE (EMA)",
+        label="Val MAE",
     )
-    ax9.axvline(
+
+    ax.axvline(
         best_epoch,
-        color="#2ca02c",
-        ls="--",
-        lw=1.2,
-        alpha=0.7,
+        linestyle="--",
         label=f"Best epoch ({best_epoch})",
     )
-    ax9.set_xlabel("Epoch")
-    ax9.set_ylabel("Loss / MAE")
-    ax9.set_title("Training History (log scale)")
-    ax9.set_yscale("log")
-    ax9.legend(
-        loc="upper right",
-        facecolor="#ffffff",
-        edgecolor="#cccccc",
-        labelcolor="#333333",
-        ncol=2,
-    )
 
-    fig.suptitle(
-        f"WatershedLSTM — {run_id} | {input_dim} features × {seq_len}-day lookback | "
-        f"{'Bi' if cfg.bidirectional else ''}LSTM {cfg.units_1}→{cfg.units_2} + Attn + EMA",
-        color="#111111",
-        fontsize=13,
-        fontfamily="monospace",
-        y=0.98,
-    )
+    ax.set_yscale("log")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss / MAE")
+    ax.set_title("Training History")
+    ax.legend()
 
-    # fig_path = FIG_DIR / "lstm_results.png"
-    fig_path = FIG_DIR / f"lstm_results_{tag}.png"
+    save_fig(fig, "training_history")
 
-    plt.savefig(
-        fig_path, dpi=150, bbox_inches="tight", facecolor="#ffffff", edgecolor="none"
-    )
-    plt.close()
-    print(f"\nDashboard → {fig_path}")
+    # ==========================================================================
+    # 9. Metrics Figure
+    # ==========================================================================
+    # fig, ax = plt.subplots(figsize=(6, 6))
+    # ax.axis("off")
+
+    # metrics_text = (
+    #     f"R²      : {r2:.4f}\n"
+    #     f"NSE     : {nse_val:.4f}\n"
+    #     f"KGE     : {kge_val:.4f}\n"
+    #     f"logNSE  : {log_nse_val:.4f}\n\n"
+    #     f"MAE     : {mae_real:.3f}\n"
+    #     f"RMSE    : {rmse_real:.3f}\n"
+    #     f"PBIAS   : {pbias:+.2f}%\n\n"
+    #     f"Peak Bias : {peak_bias:+.2f}%\n"
+    #     f"Peak MAE  : {peak_mae:.3f}\n"
+    #     f"Peak RMSE : {peak_rmse:.3f}"
+    # )
+
+    # ax.text(
+    #     0.05,
+    #     0.95,
+    #     metrics_text,
+    #     va="top",
+    #     fontsize=11,
+    #     fontfamily="monospace",
+    # )
+
+    # save_fig(fig, "metrics")
+
+    print(f"\nSaved individual figures to: {FIG_DIR}")
 
     print(f"\n{'=' * 72}")
     print(f"TARGET CHECK:  NSE={nse_val:.3f}  |  " f"KGE={kge_val:.3f}")

@@ -1,267 +1,233 @@
 import os
-import sys
+import argparse
+import inspect
+import importlib.util
 import numpy as np
 import pandas as pd
-import torch
 from pathlib import Path
-import matplotlib
+import torch
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
+# ── Paths ────────────────────────────────────────────────────────────────────
 ROOT = Path(
     os.environ.get("WATERSHED_ROOT", "C:/Users/marck/Downloads/nahr_ibrahim_watershed")
 )
-sys.path.insert(0, str(ROOT / "src" / "models"))
-
-# ─── Configuration ──────────────────────────────────────────────────────────
-HORIZON = 1
-LOOKBACK = 30
-N_PERMUTATIONS = 10  # repeat shuffling N times for stable importance
-RANDOM_SEED = 42
-
-SEQ_DIR = ROOT / "data" / "sequences"
-SPLITS_DIR = ROOT / "data" / "splits"
-MODEL_DIR = ROOT / "models" / "trained"
-OUT_DIR = ROOT / "results" / "sensitivity"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# Feature names — must match the order used in training
-FEATURE_COLS = [
-    "precip_mm_day",
-    "precip_3day",
-    "precip_7day",
-    "precip_14day",
-    "precip_30day",
-    "precip_60day",
-    "precip_90day",
-    "precip_lag1",
-    "precip_lag2",
-    "precip_lag3",
-    "precip_lag5",
-    "api_15d",
-    "api_30d",
-    "api_60d",
-    "temp_mean_c",
-    "temp_max_c",
-    "temp_min_c",
-    "temp_range_c",
-    "swe_mm",
-    "swe_delta",
-    "snow_cover_pct",
-    "soil_moisture_mm",
-    "sm_7day_mean",
-    "sm_30day_mean",
-    "sm_anomaly",
-    "sm_deep_30day",
-    "sm_deep_anomaly",
-    "pet_mm_day",
-    "spi_3month",
-    "spei_3month",
-    "month_sin",
-    "month_cos",
-]
-assert len(FEATURE_COLS) == 32
-
-# Group features for thematic analysis
-FEATURE_GROUP = {
-    **{
-        n: "Precipitation"
-        for n in [
-            "precip_mm_day",
-            "precip_3day",
-            "precip_7day",
-            "precip_14day",
-            "precip_30day",
-            "precip_60day",
-            "precip_90day",
-            "precip_lag1",
-            "precip_lag2",
-            "precip_lag3",
-            "precip_lag5",
-            "api_15d",
-            "api_30d",
-            "api_60d",
-        ]
-    },
-    **{
-        n: "Temperature"
-        for n in ["temp_mean_c", "temp_max_c", "temp_min_c", "temp_range_c"]
-    },
-    **{n: "Snow" for n in ["swe_mm", "swe_delta", "snow_cover_pct"]},
-    **{
-        n: "Soil moisture"
-        for n in [
-            "soil_moisture_mm",
-            "sm_7day_mean",
-            "sm_30day_mean",
-            "sm_anomaly",
-            "sm_deep_30day",
-            "sm_deep_anomaly",
-        ]
-    },
-    "pet_mm_day": "PET",
-    **{n: "Drought indices" for n in ["spi_3month", "spei_3month"]},
-    **{n: "Seasonal" for n in ["month_sin", "month_cos"]},
-}
-
-# ─── Load model + sequences ─────────────────────────────────────────────────
-print(f"Sensitivity analysis at horizon h={HORIZON}")
-print(f"Lookback: {LOOKBACK} days, permutations per feature: {N_PERMUTATIONS}\n")
-
-from lstm import WatershedLSTM
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device}")
-
-# Load model
-model_path = MODEL_DIR / f"lstm_final_strategy_a_h{HORIZON}.pt"
-print(f"Loading: {model_path.name}")
-model = WatershedLSTM(input_dim=len(FEATURE_COLS)).to(device)
-state = torch.load(model_path, map_location=device, weights_only=False)
-if isinstance(state, dict) and "model_state_dict" in state:
-    model.load_state_dict(state["model_state_dict"])
-else:
-    model.load_state_dict(state)
-model.eval()
-
-# Load test sequences
-suffix = f"_h{HORIZON}_lb{LOOKBACK}"
-X_test = np.load(SEQ_DIR / f"X_test{suffix}.npy")
-y_test = np.load(SEQ_DIR / f"y_test{suffix}.npy")
-print(f"Test sequences: X shape {X_test.shape}, y shape {y_test.shape}")
-
-# Load discharge scaler so we can invert predictions back to m³/s
-scaler_df = pd.read_csv(SPLITS_DIR / "scaler_params.csv", index_col=0)
-Q_MIN = float(scaler_df.loc["discharge_m3s", "min"])
-Q_MAX = float(scaler_df.loc["discharge_m3s", "max"])
-if "__meta__" in scaler_df.index:
-    LOG_TRANSFORM = bool(float(scaler_df.loc["__meta__", "min"]))
-    LOG_EPS = float(scaler_df.loc["__meta__", "max"])
-else:
-    LOG_TRANSFORM = False
-    LOG_EPS = 0.0
 
 
-def invert(y_norm):
-    y_lin = y_norm * (Q_MAX - Q_MIN) + Q_MIN
-    if LOG_TRANSFORM:
-        return np.maximum(np.exp(y_lin) - LOG_EPS, 0.0)
-    return y_lin
-
-
-def nse(obs, pred):
-    obs = np.asarray(obs)
-    pred = np.asarray(pred)
-    denom = np.sum((obs - obs.mean()) ** 2)
-    return np.nan if denom < 1e-12 else 1.0 - np.sum((obs - pred) ** 2) / denom
-
-
-def predict(X):
-    """Run LSTM forward in batches."""
-    preds = []
-    with torch.no_grad():
-        for i in range(0, len(X), 256):
-            batch = torch.from_numpy(X[i : i + 256].astype(np.float32)).to(device)
-            out = model(batch).cpu().numpy().flatten()
-            preds.append(out)
-    return np.concatenate(preds)
-
-
-# ─── Reference NSE ──────────────────────────────────────────────────────────
-print("\nComputing reference NSE...")
-y_pred_norm = predict(X_test)
-y_pred_real = invert(y_pred_norm)
-y_obs_real = invert(y_test)
-ref_nse = nse(y_obs_real, y_pred_real)
-print(f"  Reference NSE: {ref_nse:.4f}")
-
-# ─── Permutation importance ─────────────────────────────────────────────────
-print(f"\nRunning permutation importance ({N_PERMUTATIONS} shuffles per feature)...")
-rng = np.random.default_rng(RANDOM_SEED)
-results = []
-
-for fi, fname in enumerate(FEATURE_COLS):
-    drops = []
-    for k in range(N_PERMUTATIONS):
-        Xp = X_test.copy()
-        # Shuffle this feature column across all time steps of all samples
-        # We shuffle the sample order of (time, feature) slabs to preserve the
-        # within-sequence pattern but break the relationship to the target.
-        perm = rng.permutation(len(Xp))
-        Xp[:, :, fi] = X_test[perm, :, fi]
-        y_perm = predict(Xp)
-        y_perm_real = invert(y_perm)
-        n_perm = nse(y_obs_real, y_perm_real)
-        drops.append(ref_nse - n_perm)
-    mean_drop = float(np.mean(drops))
-    std_drop = float(np.std(drops))
-    results.append(
-        {
-            "feature": fname,
-            "group": FEATURE_GROUP.get(fname, "Other"),
-            "importance_nse_drop": round(mean_drop, 4),
-            "importance_std": round(std_drop, 4),
-        }
+# ═══════════════════════════════════════════════════════════════════════════
+# Dynamic model loader (same as run_projections.py)
+# ═══════════════════════════════════════════════════════════════════════════
+def load_model_class(model_file: str, class_name: str):
+    spec = importlib.util.spec_from_file_location("model_module", model_file)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if hasattr(module, class_name):
+        return getattr(module, class_name)
+    classes = [
+        name
+        for name, obj in inspect.getmembers(module, inspect.isclass)
+        if obj.__module__ == "model_module"
+    ]
+    raise AttributeError(
+        f"Class '{class_name}' not found in {model_file}.\nAvailable: {classes}"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+def compute_nse(obs, sim):
+    """Nash–Sutcliffe Efficiency."""
+    obs = np.asarray(obs).flatten()
+    sim = np.asarray(sim).flatten()
+    mask = ~np.isnan(obs) & ~np.isnan(sim)
+    obs, sim = obs[mask], sim[mask]
+    if len(obs) == 0:
+        return np.nan
+    mean_obs = np.mean(obs)
+    if abs(mean_obs) < 1e-12:
+        return np.nan
+    return 1.0 - float(np.sum((sim - obs) ** 2) / np.sum((obs - mean_obs) ** 2))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--model_file", type=str, required=True)
+    p.add_argument("--model_class", type=str, required=True)
+    p.add_argument(
+        "--scaler_csv",
+        type=str,
+        required=True,
+        help="Scaler with __target__ and __meta__ rows for inverse transform",
+    )
+    p.add_argument(
+        "--seq_dir",
+        type=str,
+        default=str(ROOT / "data" / "sequences"),
+    )
+    p.add_argument(
+        "--seq_suffix",
+        type=str,
+        default="",
+        help='e.g. "_hybrid" for GR4J-TCN, "" for plain TCN/LSTM',
+    )
+    p.add_argument("--lookback", type=int, required=True)
+    p.add_argument("--horizon", type=int, required=True)
+    p.add_argument("--batch_size", type=int, default=512)
+    p.add_argument("--n_permutations", type=int, default=10)
+    p.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    p.add_argument("--out_csv", type=str, default=None)
+    args = p.parse_args()
+
+    device = torch.device(args.device)
+    H, LB = args.horizon, args.lookback
+    suf = f"_h{H}_lb{LB}{args.seq_suffix}"
+
+    # ── Load test sequences ───────────────────────────────────────────────
+    seq_dir = Path(args.seq_dir)
+    X_test = np.load(seq_dir / f"X_test{suf}.npy", allow_pickle=True).astype(np.float32)
+    y_test = np.load(seq_dir / f"y_test{suf}.npy", allow_pickle=True).astype(np.float32)
+    print(f"Loaded X_test{suf}: {X_test.shape}, y_test: {y_test.shape}")
+
+    n_samples, lookback, n_features = X_test.shape
+    assert lookback == LB, f"Lookback mismatch: {lookback} vs {LB}"
+
+    # ── Load scaler (only for inverse transform + feature names) ──────────
+    scaler_df = pd.read_csv(args.scaler_csv, index_col=0)
+
+    if "__target__" in scaler_df.index:
+        y_min = float(scaler_df.loc["__target__", "min"])
+        y_max = float(scaler_df.loc["__target__", "max"])
+    else:
+        y_min, y_max = 0.0, 1.0
+
+    log_transform = False
+    log_eps = 0.0
+    if "__meta__" in scaler_df.index:
+        log_transform = bool(float(scaler_df.loc["__meta__", "min"]))
+        log_eps = float(scaler_df.loc["__meta__", "max"])
+
+    # Feature names from scaler (exclude __target__ and __meta__)
+    feature_cols = [c for c in scaler_df.index if not str(c).startswith("__")]
+    if len(feature_cols) != n_features:
+        print(
+            f"WARNING: scaler has {len(feature_cols)} features, "
+            f"X_test has {n_features}. Using generic names."
+        )
+        feature_cols = [f"feat_{i}" for i in range(n_features)]
+
+    # ── Load model dynamically ────────────────────────────────────────────
+    ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
+    cfg = ckpt["config"]
+    model_class = load_model_class(args.model_file, args.model_class)
+    sig = inspect.signature(model_class.__init__)
+    model_keys = [p.name for p in sig.parameters.values() if p.name != "self"]
+    model_kwargs = {k: v for k, v in cfg.items() if k in model_keys}
+
+    if "input_dim" in model_keys:
+        model_kwargs["input_dim"] = n_features
+    if "dilations" in model_keys and "dilations" not in model_kwargs:
+        if "num_layers" in cfg:
+            model_kwargs["dilations"] = [2**i for i in range(cfg["num_layers"])]
+    if "units_1" in model_keys and "units_1" not in model_kwargs:
+        model_kwargs["units_1"] = cfg.get("units_1", cfg.get("hidden", 128))
+    if "units_2" in model_keys and "units_2" not in model_kwargs:
+        model_kwargs["units_2"] = cfg.get("units_2", cfg.get("hidden", 128))
+    if "precip_idx" in model_keys and "precip_idx" not in model_kwargs:
+        model_kwargs["precip_idx"] = cfg.get("precip_idx", 0)
+    if "pet_idx" in model_keys and "pet_idx" not in model_kwargs:
+        model_kwargs["pet_idx"] = cfg.get("pet_idx", 27)
+
+    model = model_class(**model_kwargs).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model loaded: {n_params:,} parameters")
+
+    # ── Prediction helper (inverse log + min-max) ─────────────────────────
+    def predict(X_arr):
+        preds = []
+        with torch.no_grad():
+            for i in range(0, len(X_arr), args.batch_size):
+                xb = torch.tensor(
+                    X_arr[i : i + args.batch_size], dtype=torch.float32, device=device
+                )
+                out = model(xb)
+                if out.dim() > 1:
+                    out = out.squeeze(-1)
+                preds.append(out.cpu().numpy())
+        y = np.concatenate(preds).flatten()
+        # Inverse min-max
+        y_lin = y * (y_max - y_min) + y_min
+        # Inverse log if used
+        if log_transform:
+            y_real = np.exp(y_lin) - log_eps
+        else:
+            y_real = y_lin
+        return np.maximum(y_real, 0.0)
+
+    # ── Inverse-transform observed test target ────────────────────────────
+    y_test_real = y_test.flatten() * (y_max - y_min) + y_min
+    if log_transform:
+        y_test_real = np.exp(y_test_real) - log_eps
+    y_test_real = np.maximum(y_test_real, 0.0)
+
+    # ── Baseline NSE ──────────────────────────────────────────────────────
+    y_pred_base = predict(X_test)
+    baseline_nse = compute_nse(y_test_real, y_pred_base)
+    print(f"\nBaseline test NSE: {baseline_nse:.4f}")
+
+    # ── Permutation importance ────────────────────────────────────────────
     print(
-        f"  {fi+1:>2}/{len(FEATURE_COLS)}  {fname:<22} drop={mean_drop:+.4f}  ±{std_drop:.4f}"
+        f"\nRunning {args.n_permutations} permutations for each of {n_features} features..."
     )
+    rows = []
+    rng = np.random.default_rng(42)
 
-# ─── Save and plot ──────────────────────────────────────────────────────────
-df = pd.DataFrame(results).sort_values("importance_nse_drop", ascending=False)
-out_csv = OUT_DIR / f"feature_importance_h{HORIZON}.csv"
-df.to_csv(out_csv, index=False)
-print(f"\nSaved → {out_csv.relative_to(ROOT)}")
+    for f in range(n_features):
+        nse_drops = []
+        for _ in range(args.n_permutations):
+            X_perm = X_test.copy()
+            # Flatten feature f across all samples and timesteps, shuffle, reshape
+            vals = X_perm[:, :, f].flatten()
+            rng.shuffle(vals)
+            X_perm[:, :, f] = vals.reshape(n_samples, lookback)
 
-# Top features bar plot
-fig, ax = plt.subplots(figsize=(10, 9))
-df_sorted = df.sort_values("importance_nse_drop")  # ascending so largest is on top
-group_colors = {
-    "Precipitation": "#1f77b4",
-    "Temperature": "#d62728",
-    "Snow": "#9467bd",
-    "Soil moisture": "#2ca02c",
-    "PET": "#ff7f0e",
-    "Drought indices": "#17becf",
-    "Seasonal": "#7f7f7f",
-}
-colors = [group_colors.get(g, "#888") for g in df_sorted["group"]]
-ax.barh(
-    df_sorted["feature"],
-    df_sorted["importance_nse_drop"],
-    xerr=df_sorted["importance_std"],
-    color=colors,
-    error_kw={"linewidth": 0.8, "ecolor": "#333"},
-)
-ax.set_xlabel("NSE drop when feature is shuffled")
-ax.set_title(
-    f"Permutation feature importance — LSTM h={HORIZON}\n(higher = more important)"
-)
-ax.axvline(0, color="#444", lw=1)
-ax.grid(alpha=0.3, axis="x")
+            y_pred_perm = predict(X_perm)
+            nse_perm = compute_nse(y_test_real, y_pred_perm)
+            nse_drops.append(baseline_nse - nse_perm)
 
-# Add legend
-from matplotlib.patches import Patch
+        mean_drop = float(np.mean(nse_drops))
+        std_drop = float(np.std(nse_drops))
+        rows.append(
+            {
+                "feature": feature_cols[f],
+                "baseline_nse": round(baseline_nse, 4),
+                "mean_nse_drop": round(mean_drop, 5),
+                "std_nse_drop": round(std_drop, 5),
+                "perm_nse": round(baseline_nse - mean_drop, 4),
+            }
+        )
+        print(f"  {feature_cols[f]:<<22} drop: {mean_drop:.5f} ± {std_drop:.5f}")
 
-legend_items = [
-    Patch(facecolor=c, label=g)
-    for g, c in group_colors.items()
-    if g in df_sorted["group"].values
-]
-ax.legend(handles=legend_items, loc="lower right", fontsize=9)
-plt.tight_layout()
-out_fig = OUT_DIR / f"feature_importance_h{HORIZON}.png"
-plt.savefig(out_fig, dpi=140, bbox_inches="tight")
-plt.close()
-print(f"Saved → {out_fig.relative_to(ROOT)}")
+    # ── Save ──────────────────────────────────────────────────────────────
+    df = pd.DataFrame(rows).sort_values("mean_nse_drop", ascending=False)
+    if args.out_csv:
+        out_path = Path(args.out_csv)
+    else:
+        out_path = (
+            ROOT
+            / "results"
+            / "sensitivity"
+            / f"sensitivity_{args.model_class}_h{H}_lb{LB}{args.seq_suffix}.csv"
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, index=False)
+    print(f"\nSaved → {out_path}")
 
-# ─── Group-level summary ────────────────────────────────────────────────────
-group_sum = (
-    df.groupby("group")["importance_nse_drop"].sum().sort_values(ascending=False)
-)
-print(f"\nImportance summed by feature group:")
-for g, v in group_sum.items():
-    print(f"  {g:<20} {v:+.4f}")
 
-print(f"\nDone.")
+if __name__ == "__main__":
+    main()

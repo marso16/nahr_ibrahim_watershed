@@ -30,7 +30,7 @@ GCMS = [
     "INM-CM5-0",
 ]
 SCENARIOS = ["ssp245", "ssp585"]
-HORIZONS = [1, 3, 7, 14, 30]
+HORIZONS = [1, 3, 14]
 
 # IPCC AR6-aligned periods
 PERIODS = {
@@ -54,8 +54,6 @@ hist_baseline = hist[
     (hist["date"] >= PERIODS["Historical (1995-2014)"][0])
     & (hist["date"] <= PERIODS["Historical (1995-2014)"][1])
 ].copy()
-# Note: master CSV starts in 2000, so the "historical" baseline really
-# covers 2000-2014. We'll be honest about this in plots.
 hist_actual_start = hist_baseline["date"].min().date()
 print(
     f"  Historical: {len(hist_baseline)} days "
@@ -74,7 +72,7 @@ def load_projection(gcm, scenario, horizon):
     return df.sort_values("date").reset_index(drop=True)
 
 
-# Pre-load all projections (h=1 is the headline for analysis)
+# Pre-load all projections
 print("Loading all projections...")
 all_projections = {}  # key: (gcm, scenario, horizon) → DataFrame
 for gcm in GCMS:
@@ -161,6 +159,10 @@ for horizon in HORIZONS:
     table.to_csv(out_path, index=False)
     print(f"\n  h={horizon} → {out_path.relative_to(ROOT)}")
 
+    if table.empty:
+        print(f"    No projections loaded for h={horizon}, skipping ensemble stats.")
+        continue
+
     # Ensemble medians (across GCMs) per scenario
     ens = (
         table.groupby("scenario")
@@ -202,73 +204,83 @@ def build_ensemble_yearly(scenario, horizon=PLOT_HORIZON):
     return pd.DataFrame(yearly)
 
 
-fig, ax = plt.subplots(figsize=(14, 5.5))
-
-# Historical baseline (annual means)
-hist_yearly = hist.copy()
-hist_yearly["year"] = hist_yearly["date"].dt.year
-hist_annual = hist_yearly.groupby("year")["discharge_m3s"].mean()
-ax.plot(
-    hist_annual.index,
-    hist_annual.values,
-    color=HIST_COLOR,
-    lw=1.6,
-    label="Historical (GloFAS, 2000-2025)",
+# Guard: skip if no data for the plot horizon
+has_plot_data = any(
+    (gcm, scen, PLOT_HORIZON) in all_projections for gcm in GCMS for scen in SCENARIOS
 )
 
-# Two scenarios with ensemble spread
-for scen in SCENARIOS:
-    ens = build_ensemble_yearly(scen)
-    median = ens.median(axis=1)
-    q25 = ens.quantile(0.25, axis=1)
-    q75 = ens.quantile(0.75, axis=1)
-    q05 = ens.quantile(0.05, axis=1)
-    q95 = ens.quantile(0.95, axis=1)
+if not has_plot_data:
+    print(f"  SKIPPING time-series plot: no projections for h={PLOT_HORIZON}")
+else:
+    fig, ax = plt.subplots(figsize=(14, 5.5))
 
-    # 5-95% spread (light) and 25-75% spread (darker)
-    ax.fill_between(ens.index, q05, q95, color=SCEN_COLOR[scen], alpha=0.10)
-    ax.fill_between(ens.index, q25, q75, color=SCEN_COLOR[scen], alpha=0.25)
+    # Historical baseline (annual means)
+    hist_yearly = hist.copy()
+    hist_yearly["year"] = hist_yearly["date"].dt.year
+    hist_annual = hist_yearly.groupby("year")["discharge_m3s"].mean()
     ax.plot(
-        ens.index,
-        median.values,
-        color=SCEN_COLOR[scen],
-        lw=2.0,
-        label=f"{scen.upper()} median (7 GCMs)",
+        hist_annual.index,
+        hist_annual.values,
+        color=HIST_COLOR,
+        lw=1.6,
+        label="Historical (GloFAS, 2000-2025)",
     )
 
-# Period markers
-for period_key, (start, end) in PERIODS.items():
-    if "Historical" in period_key:
-        continue
-    yr_start = pd.Timestamp(start).year
-    yr_end = pd.Timestamp(end).year
-    ax.axvspan(yr_start, yr_end, color="gold", alpha=0.10, zorder=-1)
-    ax.text(
-        (yr_start + yr_end) / 2,
-        ax.get_ylim()[1] * 0.97,
-        period_key.split(" (")[0],
-        ha="center",
-        fontsize=9,
-        style="italic",
-        color="#666",
+    # Two scenarios with ensemble spread
+    for scen in SCENARIOS:
+        ens = build_ensemble_yearly(scen)
+        if ens.empty:
+            continue
+        median = ens.median(axis=1)
+        q25 = ens.quantile(0.25, axis=1)
+        q75 = ens.quantile(0.75, axis=1)
+        q05 = ens.quantile(0.05, axis=1)
+        q95 = ens.quantile(0.95, axis=1)
+
+        # 5-95% spread (light) and 25-75% spread (darker)
+        ax.fill_between(ens.index, q05, q95, color=SCEN_COLOR[scen], alpha=0.10)
+        ax.fill_between(ens.index, q25, q75, color=SCEN_COLOR[scen], alpha=0.25)
+        ax.plot(
+            ens.index,
+            median.values,
+            color=SCEN_COLOR[scen],
+            lw=2.0,
+            label=f"{scen.upper()} median (7 GCMs)",
+        )
+
+    # Period markers
+    for period_key, (start, end) in PERIODS.items():
+        if "Historical" in period_key:
+            continue
+        yr_start = pd.Timestamp(start).year
+        yr_end = pd.Timestamp(end).year
+        ax.axvspan(yr_start, yr_end, color="gold", alpha=0.10, zorder=-1)
+        ax.text(
+            (yr_start + yr_end) / 2,
+            ax.get_ylim()[1] * 0.97,
+            period_key.split(" (")[0],
+            ha="center",
+            fontsize=9,
+            style="italic",
+            color="#666",
+        )
+
+    ax.set_title(
+        f"Projected annual mean discharge at Nahr Ibrahim outlet — h=1 forecast\n"
+        f"Multi-GCM ensemble (7 GCMs), 2015-2100",
+        fontsize=12,
     )
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Mean annual discharge (m³/s)")
+    ax.legend(loc="upper right", fontsize=10)
+    ax.grid(alpha=0.3)
+    ax.set_xlim(1995, 2100)
 
-ax.set_title(
-    f"Projected annual mean discharge at Nahr Ibrahim outlet — h=1 forecast\n"
-    f"Multi-GCM ensemble (7 GCMs), 2015-2100",
-    fontsize=12,
-)
-ax.set_xlabel("Year")
-ax.set_ylabel("Mean annual discharge (m³/s)")
-ax.legend(loc="upper right", fontsize=10)
-ax.grid(alpha=0.3)
-ax.set_xlim(1995, 2100)
-
-plt.tight_layout()
-out_path = OUT_FIG_DIR / "ensemble_timeseries.png"
-plt.savefig(out_path, dpi=150, bbox_inches="tight")
-plt.close()
-print(f"  Saved → {out_path.relative_to(ROOT)}")
+    plt.tight_layout()
+    out_path = OUT_FIG_DIR / "ensemble_timeseries.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved → {out_path.relative_to(ROOT)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -286,67 +298,75 @@ def monthly_climatology(df, period_key, value_col):
     return sub.groupby("month")[value_col].mean()
 
 
-# Historical
-hist_monthly = monthly_climatology(
-    hist.assign(discharge=hist["discharge_m3s"]).rename(
-        columns={"discharge_m3s": "discharge"}
-    ),
-    "Historical (1995-2014)",
-    "discharge",
+# Guard: skip if no data for the plot horizon
+has_seasonal_data = any(
+    (gcm, scen, PLOT_HORIZON) in all_projections for gcm in GCMS for scen in SCENARIOS
 )
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-for ax, period in zip(axes, ["Mid-century (2041-2060)", "End-century (2081-2100)"]):
-    ax.plot(
-        hist_monthly.index,
-        hist_monthly.values,
-        color=HIST_COLOR,
-        lw=2.5,
-        marker="o",
-        label="Historical (1995-2014)",
+if not has_seasonal_data:
+    print(f"  SKIPPING seasonal cycle plot: no projections for h={PLOT_HORIZON}")
+else:
+    # Historical
+    hist_monthly = monthly_climatology(
+        hist.assign(discharge=hist["discharge_m3s"]).rename(
+            columns={"discharge_m3s": "discharge"}
+        ),
+        "Historical (1995-2014)",
+        "discharge",
     )
 
-    for scen in SCENARIOS:
-        ens_monthly = []
-        for gcm in GCMS:
-            df = all_projections.get((gcm, scen, PLOT_HORIZON))
-            if df is None:
-                continue
-            m = monthly_climatology(df, period, "discharge_m3s_pred")
-            ens_monthly.append(m)
-        if not ens_monthly:
-            continue
-        ensdf = pd.concat(ens_monthly, axis=1)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+    for ax, period in zip(axes, ["Mid-century (2041-2060)", "End-century (2081-2100)"]):
         ax.plot(
-            ensdf.index,
-            ensdf.median(axis=1),
-            color=SCEN_COLOR[scen],
-            lw=2.0,
-            marker="s",
-            label=f"{scen.upper()} median",
-        )
-        ax.fill_between(
-            ensdf.index,
-            ensdf.quantile(0.25, axis=1),
-            ensdf.quantile(0.75, axis=1),
-            color=SCEN_COLOR[scen],
-            alpha=0.20,
+            hist_monthly.index,
+            hist_monthly.values,
+            color=HIST_COLOR,
+            lw=2.5,
+            marker="o",
+            label="Historical (1995-2014)",
         )
 
-    ax.set_title(period)
-    ax.set_xlabel("Month")
-    ax.set_xticks(range(1, 13))
-    ax.set_xticklabels(["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"])
-    ax.grid(alpha=0.3)
-    ax.legend(loc="upper right", fontsize=9)
+        for scen in SCENARIOS:
+            ens_monthly = []
+            for gcm in GCMS:
+                df = all_projections.get((gcm, scen, PLOT_HORIZON))
+                if df is None:
+                    continue
+                m = monthly_climatology(df, period, "discharge_m3s_pred")
+                ens_monthly.append(m)
+            if not ens_monthly:
+                continue
+            ensdf = pd.concat(ens_monthly, axis=1)
+            ax.plot(
+                ensdf.index,
+                ensdf.median(axis=1),
+                color=SCEN_COLOR[scen],
+                lw=2.0,
+                marker="s",
+                label=f"{scen.upper()} median",
+            )
+            ax.fill_between(
+                ensdf.index,
+                ensdf.quantile(0.25, axis=1),
+                ensdf.quantile(0.75, axis=1),
+                color=SCEN_COLOR[scen],
+                alpha=0.20,
+            )
 
-axes[0].set_ylabel("Mean monthly discharge (m³/s)")
-plt.suptitle("Seasonal cycle changes — h=1 forecast", fontsize=12)
-plt.tight_layout()
-out_path = OUT_FIG_DIR / "seasonal_cycle.png"
-plt.savefig(out_path, dpi=150, bbox_inches="tight")
-plt.close()
-print(f"  Saved → {out_path.relative_to(ROOT)}")
+        ax.set_title(period)
+        ax.set_xlabel("Month")
+        ax.set_xticks(range(1, 13))
+        ax.set_xticklabels(["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"])
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper right", fontsize=9)
+
+    axes[0].set_ylabel("Mean monthly discharge (m³/s)")
+    plt.suptitle("Seasonal cycle changes — h=1 forecast", fontsize=12)
+    plt.tight_layout()
+    out_path = OUT_FIG_DIR / "seasonal_cycle.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved → {out_path.relative_to(ROOT)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -390,21 +410,24 @@ for gcm in GCMS:
             )
 
 extremes_df = pd.DataFrame(rows)
-extremes_df.to_csv(OUT_TAB_DIR / "extreme_event_stats.csv", index=False)
-ext_summary = (
-    extremes_df.groupby(["scenario", "period"])
-    .agg(
-        flood_median=("flood_days_pct", "median"),
-        flood_min=("flood_days_pct", "min"),
-        flood_max=("flood_days_pct", "max"),
-        dry_median=("dry_days_pct", "median"),
-        dry_min=("dry_days_pct", "min"),
-        dry_max=("dry_days_pct", "max"),
+if extremes_df.empty:
+    print(f"  No extreme-event data for h={PLOT_HORIZON}, skipping table.")
+else:
+    extremes_df.to_csv(OUT_TAB_DIR / "extreme_event_stats.csv", index=False)
+    ext_summary = (
+        extremes_df.groupby(["scenario", "period"])
+        .agg(
+            flood_median=("flood_days_pct", "median"),
+            flood_min=("flood_days_pct", "min"),
+            flood_max=("flood_days_pct", "max"),
+            dry_median=("dry_days_pct", "median"),
+            dry_min=("dry_days_pct", "min"),
+            dry_max=("dry_days_pct", "max"),
+        )
+        .round(2)
     )
-    .round(2)
-)
-print("\n  Ensemble extreme-event frequencies:")
-print(ext_summary.to_string())
+    print("\n  Ensemble extreme-event frequencies:")
+    print(ext_summary.to_string())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -423,60 +446,68 @@ def fdc(values):
     return exceed, sorted_q
 
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-for ax, period in zip(axes, ["Mid-century (2041-2060)", "End-century (2081-2100)"]):
-    # Historical FDC
-    e_h, q_h = fdc(hist_baseline["discharge_m3s"].values)
-    ax.plot(e_h, q_h, color=HIST_COLOR, lw=2.0, label="Historical (1995-2014)")
+# Guard: skip if no data for the plot horizon
+has_fdc_data = any(
+    (gcm, scen, PLOT_HORIZON) in all_projections for gcm in GCMS for scen in SCENARIOS
+)
 
-    # Per-scenario ensemble FDC (using ensemble of all GCM days)
-    for scen in SCENARIOS:
-        all_days = []
-        for gcm in GCMS:
-            df = all_projections.get((gcm, scen, PLOT_HORIZON))
-            if df is None:
+if not has_fdc_data:
+    print(f"  SKIPPING FDC plot: no projections for h={PLOT_HORIZON}")
+else:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    for ax, period in zip(axes, ["Mid-century (2041-2060)", "End-century (2081-2100)"]):
+        # Historical FDC
+        e_h, q_h = fdc(hist_baseline["discharge_m3s"].values)
+        ax.plot(e_h, q_h, color=HIST_COLOR, lw=2.0, label="Historical (1995-2014)")
+
+        # Per-scenario ensemble FDC (using ensemble of all GCM days)
+        for scen in SCENARIOS:
+            all_days = []
+            for gcm in GCMS:
+                df = all_projections.get((gcm, scen, PLOT_HORIZON))
+                if df is None:
+                    continue
+                start, end = PERIODS[period]
+                sub = df[(df["date"] >= start) & (df["date"] <= end)]
+                all_days.append(sub["discharge_m3s_pred"].values)
+            if not all_days:
                 continue
-            start, end = PERIODS[period]
-            sub = df[(df["date"] >= start) & (df["date"] <= end)]
-            all_days.append(sub["discharge_m3s_pred"].values)
-        if not all_days:
-            continue
-        # Per-GCM FDC, then ensemble median curve
-        ens_q_at_pct = []
-        eval_pcts = np.logspace(np.log10(0.5), np.log10(99.5), 50)
-        for arr in all_days:
-            e, q = fdc(arr)
-            ens_q_at_pct.append(np.interp(eval_pcts, e, q))
-        ens_arr = np.array(ens_q_at_pct)
-        ax.plot(
-            eval_pcts,
-            np.median(ens_arr, axis=0),
-            color=SCEN_COLOR[scen],
-            lw=2.0,
-            label=f"{scen.upper()} median",
-        )
-        ax.fill_between(
-            eval_pcts,
-            np.quantile(ens_arr, 0.25, axis=0),
-            np.quantile(ens_arr, 0.75, axis=0),
-            color=SCEN_COLOR[scen],
-            alpha=0.20,
-        )
+            # Per-GCM FDC, then ensemble median curve
+            ens_q_at_pct = []
+            eval_pcts = np.logspace(np.log10(0.5), np.log10(99.5), 50)
+            for arr in all_days:
+                e, q = fdc(arr)
+                ens_q_at_pct.append(np.interp(eval_pcts, e, q))
+            ens_arr = np.array(ens_q_at_pct)
+            ax.plot(
+                eval_pcts,
+                np.median(ens_arr, axis=0),
+                color=SCEN_COLOR[scen],
+                lw=2.0,
+                label=f"{scen.upper()} median",
+            )
+            ax.fill_between(
+                eval_pcts,
+                np.quantile(ens_arr, 0.25, axis=0),
+                np.quantile(ens_arr, 0.75, axis=0),
+                color=SCEN_COLOR[scen],
+                alpha=0.20,
+            )
 
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Exceedance probability (%)")
-    ax.set_ylabel("Discharge (m³/s)")
-    ax.set_title(period)
-    ax.legend(loc="lower left", fontsize=9)
-    ax.grid(alpha=0.3, which="both")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Exceedance probability (%)")
+        ax.set_ylabel("Discharge (m³/s)")
+        ax.set_title(period)
+        ax.legend(loc="lower left", fontsize=9)
+        ax.grid(alpha=0.3, which="both")
 
-plt.suptitle("Flow duration curves — h=1 forecast", fontsize=12)
-plt.tight_layout()
-out_path = OUT_FIG_DIR / "flow_duration_curves.png"
-plt.savefig(out_path, dpi=150, bbox_inches="tight")
-plt.close()
-print(f"  Saved → {out_path.relative_to(ROOT)}")
+    plt.suptitle("Flow duration curves — h=1 forecast", fontsize=12)
+    plt.tight_layout()
+    out_path = OUT_FIG_DIR / "flow_duration_curves.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved → {out_path.relative_to(ROOT)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -527,8 +558,11 @@ for scen in SCENARIOS:
         )
 
 headline = pd.DataFrame(headline_rows)
-headline.to_csv(OUT_TAB_DIR / "headline_summary.csv", index=False)
-print(headline.to_string(index=False))
+if headline.empty:
+    print(f"  No headline data for h={PLOT_HORIZON}, skipping.")
+else:
+    headline.to_csv(OUT_TAB_DIR / "headline_summary.csv", index=False)
+    print(headline.to_string(index=False))
 
 # ─── Done ────────────────────────────────────────────────────────────────────
 print(f"\n{'═' * 70}")

@@ -1,18 +1,3 @@
-"""
-Build future feature CSVs for each (GCM × scenario) combination by mirroring
-preprocess2.py exactly, using bias-corrected CMIP6 atmospheric data plus:
-
-- Calibrated bucket model → simulated 28-100cm soil moisture
-- Day-of-year climatology → snow features, deep soil moisture, snow cover
-- Historical-trained Hamon PET correction factor
-- Historical-fitted SPI/SPEI parameters
-
-Output:
-  data/master/future/{gcm}__{scenario}.csv
-    columns: identical to data/master/nahr_ibrahim_master_model.csv minus
-             discharge_m3s/month/season (we add month/season for completeness)
-"""
-
 import os
 import json
 import math

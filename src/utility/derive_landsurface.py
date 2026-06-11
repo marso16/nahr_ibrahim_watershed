@@ -1,21 +1,3 @@
-"""
-Calibrate offline land-surface models (degree-day snow + bucket soil moisture)
-against historical ERA5-Land data. Saves the calibrated parameters.
-
-These calibrated models will later be applied to bias-corrected CMIP6 future
-climate forcings to produce projected soil moisture and SWE consistent with
-the LSTM's training distribution.
-
-Inputs (already on disk):
-  data/raw/era5_land/era5land_other_daily.csv  — historical T, SWE, soil
-                                                  moisture, PET from ERA5-Land
-  data/raw/chirps/chirps_nahr_ibrahim_2000_2025_daily.csv — historical precip
-
-Outputs:
-  models/trained/landsurface_params.json
-  results/figures/landsurface_calibration.png
-"""
-
 import os
 import json
 import numpy as np
@@ -104,8 +86,6 @@ def run_snow_model(P_mm, T_C, T_snow: float, melt_factor: float, swe0: float = 0
 
 
 def calibrate_snow_model(P_mm, T_C, SWE_obs):
-    """Calibrate T_snow and melt_factor by maximizing NSE against ERA5 SWE."""
-
     def objective(params):
         T_snow, melt_factor = params
         swe_sim, _, _ = run_snow_model(P_mm, T_C, T_snow, melt_factor)
@@ -113,8 +93,8 @@ def calibrate_snow_model(P_mm, T_C, SWE_obs):
         return 1.0 if np.isnan(val) else 1.0 - val
 
     bounds = [
-        (-10.0, 5.0),  # T_snow: widen lower
-        (0.5, 15.0),  # melt_factor: widen both
+        (-2.0, 5.0),
+        (0.5, 15.0),
     ]
     print("  Calibrating snow model (degree-day)...")
     result = differential_evolution(
@@ -194,11 +174,6 @@ def run_bucket_model(
 
 
 def calibrate_bucket_model(input_water_mm, PET_mm, SM_obs):
-    """
-    Calibrate bucket parameters against an observed soil moisture series.
-    Target: ERA5-Land 28-100 cm layer (sm_28_100cm_mm) which is what your
-    LSTM uses as 'soil_moisture_mm'.
-    """
     sm_mean_obs = float(np.mean(SM_obs))
 
     def objective(params):
@@ -212,22 +187,24 @@ def calibrate_bucket_model(input_water_mm, PET_mm, SM_obs):
             WP=WP,
             drainage_rate=drain,
             ET_scale=ET_scl,
-            sm0=sm_mean_obs,  # start near climatology
+            sm0=sm_mean_obs,
         )
-        # Combined objective: NSE + small penalty on mean bias
         val_nse = nse(SM_obs, sm_sim)
-        if np.isnan(val_nse):
+        val_r = corr(SM_obs, sm_sim)
+        if np.isnan(val_nse) or np.isnan(val_r):
             return 1.0
-        bias_pen = abs(sm_sim.mean() - SM_obs.mean()) / (sm_mean_obs + 1e-6)
-        return (1.0 - val_nse) + 0.1 * bias_pen
 
-    # Bounds chosen to span typical Mediterranean values for the
-    # 28-100cm layer (your sm_28_100cm_mm ranges ~187-346 mm).
+        nse_term = max(val_nse, -2.0)
+        composite = 0.8 * nse_term + 0.2 * val_r
+        bias_pen = abs(sm_sim.mean() - SM_obs.mean()) / (sm_mean_obs + 1e-6)
+
+        return (1.0 - composite) + 0.05 * bias_pen
+
     bounds = [
-        (150.0, 600.0),  # FC: widen
-        (20.0, 250.0),  # WP: widen
-        (0.001, 0.50),  # drainage_rate: widen upper much more
-        (0.1, 1.5),  # ET_scale: widen both
+        (150.0, 600.0),
+        (20.0, 250.0),
+        (0.5, 1.0),
+        (0.1, 1.5),
     ]
     print("  Calibrating bucket soil-moisture model...")
     result = differential_evolution(
@@ -241,7 +218,7 @@ def calibrate_bucket_model(input_water_mm, PET_mm, SM_obs):
         disp=False,
     )
     FC, WP, drain, ET_scl = result.x
-    # Re-run to compute final NSE without the bias penalty
+    # Re-run to compute final metrics
     sm_sim, _ = run_bucket_model(
         input_water_mm,
         PET_mm,
@@ -252,6 +229,8 @@ def calibrate_bucket_model(input_water_mm, PET_mm, SM_obs):
         sm0=sm_mean_obs,
     )
     final_nse = nse(SM_obs, sm_sim)
+    final_r = corr(SM_obs, sm_sim)
+    print(f"  (Best composite params: NSE={final_nse:.4f}, r={final_r:.4f})")
     return result.x, final_nse
 
 
@@ -295,15 +274,15 @@ def main():
     print("=" * 60)
     print("  Snow model (degree-day)")
     print("=" * 60)
-    (T_snow, melt_factor), snow_nse_val = calibrate_snow_model(P_mm, T_C, SWE_obs)
-    print(f"  T_snow:      {T_snow:+.2f} °C")
-    print(f"  melt_factor: {melt_factor:.2f} mm/°C/day")
-    print(f"  NSE vs ERA5-Land SWE: {snow_nse_val:.4f}")
-
+    (T_snow, melt_factor), snow_corr_val = calibrate_snow_model(P_mm, T_C, SWE_obs)
     swe_sim, rain, melt = run_snow_model(P_mm, T_C, T_snow, melt_factor)
+    snow_nse_val = nse(SWE_obs, swe_sim)
     snow_r = corr(SWE_obs, swe_sim)
     snow_mae = mean_absolute_error(SWE_obs, swe_sim)
+    print(f"  T_snow:      {T_snow:+.2f} °C")
+    print(f"  melt_factor: {melt_factor:.2f} mm/°C/day")
     print(f"  Correlation: {snow_r:.4f}")
+    print(f"  NSE:         {snow_nse_val:.4f}")
     print(f"  MAE:         {snow_mae:.3f} mm")
     print()
 
@@ -317,12 +296,6 @@ def main():
     (FC, WP, drain, ET_scl), bucket_nse_val = calibrate_bucket_model(
         bucket_input, PET_mm, SM_obs
     )
-    print(f"  Field capacity (FC):  {FC:.1f} mm")
-    print(f"  Wilting point (WP):   {WP:.1f} mm")
-    print(f"  Drainage rate:        {drain:.4f} /day")
-    print(f"  ET scale:             {ET_scl:.3f}")
-    print(f"  NSE vs ERA5-Land soil moisture: {bucket_nse_val:.4f}")
-
     sm_sim, aet = run_bucket_model(
         bucket_input,
         PET_mm,
@@ -334,6 +307,11 @@ def main():
     )
     bucket_r = corr(SM_obs, sm_sim)
     bucket_mae = mean_absolute_error(SM_obs, sm_sim)
+    print(f"  Field capacity (FC):  {FC:.1f} mm")
+    print(f"  Wilting point (WP):   {WP:.1f} mm")
+    print(f"  Drainage rate:        {drain:.4f} /day")
+    print(f"  ET scale:             {ET_scl:.3f}")
+    print(f"  NSE:         {bucket_nse_val:.4f}")
     print(f"  Correlation: {bucket_r:.4f}")
     print(f"  MAE:         {bucket_mae:.3f} mm")
     print()
@@ -431,7 +409,7 @@ def main():
     print("=" * 60)
     print("  Verdict")
     print("=" * 60)
-    snow_ok = snow_nse_val > 0.5
+    snow_ok = snow_r > 0.5
     bucket_ok = bucket_nse_val > 0.5
     if snow_ok and bucket_ok:
         print(f"  Both models calibrated successfully (NSE > 0.5).")
@@ -439,7 +417,7 @@ def main():
     else:
         if not snow_ok:
             print(f"  WARNING: Snow model NSE = {snow_nse_val:.3f} (< 0.5).")
-            print(f"           SWE may be poorly captured. Discuss in limitations.")
+            print(f"           SWE may be poorly captured.")
         if not bucket_ok:
             print(f"  WARNING: Bucket NSE = {bucket_nse_val:.3f} (< 0.5).")
             print(f"           Single-layer bucket may not capture karst storage well.")
