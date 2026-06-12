@@ -52,19 +52,6 @@ FEATURES_32 = [
 
 # ── Standalone GR4J forward pass (numpy) ─────────────────────────────────
 def gr4j_forward(precip, pet, x1=300.0, x2=0.5, x3=80.0, x4=2.5):
-    """
-    Returns (n, 10) log-transformed state variables:
-      0: production_store_fill
-      1: routing_store_fill
-      2: infiltration_flux
-      3: actual_evapotranspiration
-      4: percolation
-      5: routing_input
-      6: total_routing_flux
-      7: groundwater_exchange  (signed, not log-transformed)
-      8: routing_store_outflow
-      9: simulated_discharge
-    """
     n = len(precip)
     S = np.zeros(n)
     R = np.zeros(n)

@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import random
@@ -21,10 +22,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Config
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def get_config():
@@ -56,8 +53,8 @@ def get_config():
     p.add_argument("--lr", type=float, default=0.0002)
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--batch_size", type=int, default=None)
-    p.add_argument("--epochs", type=int, default=500)
-    p.add_argument("--patience", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--patience", type=int, default=35)
     p.add_argument("--warmup_epochs", type=int, default=10)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true", default=True)
@@ -65,14 +62,33 @@ def get_config():
     p.add_argument(
         "--loss",
         type=str,
-        default="bias_huber",
+        default="huber",
         choices=["huber", "nse", "peak", "bias_huber"],
     )
-    p.add_argument("--peak_percentile", type=float, default=85.0)
-    p.add_argument("--peak_loss_weight", type=float, default=2.5)
+    p.add_argument("--peak_percentile", type=float, default=90.0)
+    p.add_argument("--peak_loss_weight", type=float, default=2.0)
     p.add_argument("--huber_delta", type=float, default=0.15)
+    p.add_argument(
+        "--x2_min",
+        type=float,
+        default=-5.0,
+        help="GR4J X2 lower bound (allow negative for groundwater loss)",
+    )
+    p.add_argument("--x2_max", type=float, default=5.0)
+    p.add_argument(
+        "--freeze_gr4j_epochs",
+        type=int,
+        default=0,
+        help="Freeze GR4J X1-X4 for this many epochs at start (0 = no freeze)",
+    )
+    p.add_argument(
+        "--jit_gr4j",
+        action="store_true",
+        default=True,
+        help="JIT-script GR4J extractor for speed",
+    )
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--run_tag", type=str, default=None)
     p.add_argument(
         "--seq_suffix",
@@ -90,14 +106,8 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    # Speed: deterministic=False + benchmark=True gives 10-15% speedup
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Losses
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class StableNSELoss(nn.Module):
@@ -117,7 +127,7 @@ class PeakFocusedLoss(nn.Module):
         self,
         threshold: float,
         huber_delta: float = 0.15,
-        peak_weight: float = 2.5,
+        peak_weight: float = 2.0,
     ):
         super().__init__()
         self.huber = nn.SmoothL1Loss(beta=huber_delta, reduction="none")
@@ -144,65 +154,82 @@ class PeakFocusedLoss(nn.Module):
 
 
 class BiasPenalizedHuber(nn.Module):
-    """
-    Huber + explicit volume-bias penalty.
-    bias_weight = 0.5 is a good starting point.
+    """Huber + EMA-smoothed bias penalty.
+
+    The per-batch (pred_mean - true_mean) is noisy when peak events are rare,
+    so we track an exponential moving average of the bias across batches.
     """
 
-    def __init__(self, huber_delta: float = 0.15, bias_weight: float = 0.5):
+    def __init__(
+        self,
+        huber_delta: float = 0.15,
+        bias_weight: float = 0.5,
+        ema_decay: float = 0.9,
+    ):
         super().__init__()
         self.huber = nn.SmoothL1Loss(beta=huber_delta)
         self.bias_weight = bias_weight
+        self.ema_decay = ema_decay
+        self.register_buffer("bias_ema", torch.tensor(0.0))
+        self.register_buffer("initialized", torch.tensor(False))
 
     def forward(self, y_pred, y_true):
         huber = self.huber(y_pred, y_true)
-        bias_penalty = torch.abs(y_pred.mean() - y_true.mean())
+        with torch.no_grad():
+            batch_bias = (y_pred.mean() - y_true.mean()).detach()
+            if not self.initialized:
+                self.bias_ema.copy_(batch_bias)
+                self.initialized.fill_(True)
+            else:
+                self.bias_ema.mul_(self.ema_decay).add_(
+                    batch_bias, alpha=1.0 - self.ema_decay
+                )
+        # Use current batch bias for gradient, scaled by EMA magnitude for stability.
+        current_bias = y_pred.mean() - y_true.mean()
+        scale = torch.abs(self.bias_ema).clamp(min=1e-4)
+        bias_penalty = torch.abs(current_bias) * (scale / (scale + 1e-2))
         return huber + self.bias_weight * bias_penalty
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GR4J Feature Extractor (differentiable, X4 controls routing delay)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 class GR4JFeatureExtractor(nn.Module):
+    """Differentiable GR4J-like reservoir features.
+
+    Note: this is a simplified hybrid formulation, NOT canonical GR4J.
+    The canonical GR4J uses two unit hydrographs (UH1 over X4 timesteps,
+    UH2 over 2*X4 timesteps) with a 90/10 split between routing and direct
+    runoff. Here we collapse the unit hydrographs into a single learned
+    `store_frac` derived from X4, which is sufficient for feature extraction
+    in the hybrid model but is not a strict GR4J implementation.
+    """
+
     def __init__(self, precip_idx: int = 0, pet_idx: int = 27, eps: float = 1e-6):
         super().__init__()
         self.precip_idx = precip_idx
         self.pet_idx = pet_idx
         self.eps = eps
 
-        # X1: production store capacity [mm]  (softplus > 1)
-        # X2: groundwater exchange [mm/day]     (positive for gaining karst springs)
-        # X3: routing store capacity [mm]       (softplus > 1)
-        # X4: time constant [days]              (softplus > 0.5)
         self.X1 = nn.Parameter(torch.tensor(300.0))
-        self.X2 = nn.Parameter(torch.tensor(1.0))  # CHANGED: positive init for karst
+        self.X2 = nn.Parameter(torch.tensor(1.0))
         self.X3 = nn.Parameter(torch.tensor(100.0))
-        self.X4 = nn.Parameter(torch.tensor(2.2))  # typical GR4J value
+        self.X4 = nn.Parameter(torch.tensor(2.2))
 
     def forward(self, x):
-        # x: (B, T, n_feat)
         B, T, n_feat = x.shape
-        P = x[:, :, self.precip_idx]  # (B, T)
-        E = x[:, :, self.pet_idx]  # (B, T)
+        P = x[:, :, self.precip_idx]
+        E = x[:, :, self.pet_idx]
 
-        # Constrain physical parameters
         X1 = F.softplus(self.X1) + 1.0
         X2 = self.X2
         X3 = F.softplus(self.X3) + 1.0
         X4 = F.softplus(self.X4) + 0.5
 
-        # X4 controls the fraction of Q9 that enters the routing store (delayed).
         store_frac = 1.0 - torch.exp(-X4 / 0.956)
         store_frac = torch.clamp(store_frac, 0.05, 0.99)
 
-        # Initialize stores
         S = torch.zeros(B, device=x.device, dtype=x.dtype)
         R = torch.zeros(B, device=x.device, dtype=x.dtype)
 
         features = []
-        q_raw = []  # NEW: collect raw GR4J discharge (mm/day)
         for t in range(T):
             P_t = P[:, t]
             E_t = E[:, t]
@@ -210,7 +237,6 @@ class GR4JFeatureExtractor(nn.Module):
             Pn = torch.clamp(P_t - E_t, min=0.0)
             En = torch.clamp(E_t - P_t, min=0.0)
 
-            # --- Production store ---
             ratio_s = S / (X1 + self.eps)
             tanh_ps = torch.tanh(Pn / (X1 + self.eps))
             Ps = X1 * (1 - ratio_s**2) * tanh_ps / (1 + ratio_s * tanh_ps + self.eps)
@@ -222,22 +248,18 @@ class GR4JFeatureExtractor(nn.Module):
 
             S = S + torch.where(P_t >= E_t, Ps, -Es)
 
-            # Percolation
             perc_ratio = S / (5.25 * X1 + self.eps)
             Perc = S * (1.0 - (1.0 + perc_ratio**4 + self.eps) ** (-0.25))
             Perc = torch.minimum(Perc, S).clamp(min=0.0)
             S = S - Perc
 
-            # Routing input
             Pr = torch.where(P_t >= E_t, Pn - Ps, torch.zeros_like(Pn))
             Q9 = Perc + Pr
             Q9 = torch.clamp(Q9, min=0.0)
 
-            # X4-scaled split: store_frac to routing store, rest direct
             Q1 = store_frac * Q9
             Q0 = (1.0 - store_frac) * Q9
 
-            # --- Routing store ---
             ratio_r = R / (X3 + self.eps)
             Fex = X2 * (ratio_r**3.5)
             Fex = torch.clamp(Fex, min=-X3 * 2, max=X3 * 2)
@@ -250,7 +272,6 @@ class GR4JFeatureExtractor(nn.Module):
             Qr = torch.clamp(Qr, min=0.0)
 
             R = R_in - Qr
-            # Total discharge (mm/day) — standard GR4J formulation
             Q = Qr + Q0 + torch.clamp(-Fex, min=0.0)
 
             feat = torch.stack(
@@ -270,21 +291,12 @@ class GR4JFeatureExtractor(nn.Module):
             )
 
             features.append(feat)
-            q_raw.append(Q)  # (B)
 
-        features = torch.stack(features, dim=1)  # (B, T, 10)
-        q_raw = torch.stack(q_raw, dim=1)  # (B, T)
-        return features, q_raw
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TCN Backbone
-# ═══════════════════════════════════════════════════════════════════════════════
+        features = torch.stack(features, dim=1)
+        return features
 
 
 class TCNLayer(nn.Module):
-    """Causal dilated conv with residual."""
-
     def __init__(
         self,
         in_ch: int,
@@ -307,7 +319,6 @@ class TCNLayer(nn.Module):
         self.out_relu = nn.ReLU()
 
     def forward(self, x):
-        # x: (B, C, T)
         out = self.conv(x)
         if self.chomp > 0:
             out = out[:, :, : -self.chomp]
@@ -341,15 +352,9 @@ class TCNBackbone(nn.Module):
         self.layers = nn.ModuleList(layers)
 
     def forward(self, x):
-        # x: (B, C, T)
         for layer in self.layers:
             x = layer(x)
-        return x  # (B, hidden, T)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Hybrid Model
-# ═══════════════════════════════════════════════════════════════════════════════
+        return x
 
 
 class HybridGR4J_TCN(nn.Module):
@@ -365,19 +370,18 @@ class HybridGR4J_TCN(nn.Module):
     ):
         super().__init__()
         self.gr4j = GR4JFeatureExtractor(precip_idx, pet_idx)
+        self.meteo_dim = 32
+
+        # Separate LayerNorm for GR4J features so they don't get scale-dominated
+        # by raw meteo features when concatenated. log1p outputs can be 0..5+,
+        # while normalized meteo is ~N(0,1).
+        self.gr4j_norm = nn.LayerNorm(10)
+
         self.tcn = TCNBackbone(
-            input_dim + 10, hidden_dim, num_layers, kernel_size, dropout
+            self.meteo_dim + 10, hidden_dim, num_layers, kernel_size, dropout
         )
         self.tcn_norm = nn.LayerNorm(hidden_dim)
 
-        # NEW: project raw GR4J discharge (mean over time) to output space
-        self.q_proj = nn.Sequential(
-            nn.Linear(1, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-
-        # Head: last timestep + global average pool over TCN output
         head_dim = hidden_dim * 2
         self.head = nn.Sequential(
             nn.LayerNorm(head_dim),
@@ -388,31 +392,21 @@ class HybridGR4J_TCN(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, T, F)
-        gr4j_feat, q_raw = self.gr4j(x)  # NEW: unpack q_raw
-        x = torch.cat([x, gr4j_feat], dim=-1)  # (B, T, F+10)
+        meteo = x[:, :, : self.meteo_dim]
+        gr4j_feat = self.gr4j(meteo)
+        gr4j_feat = self.gr4j_norm(gr4j_feat)
+        x = torch.cat([meteo, gr4j_feat], dim=-1)
 
-        x = x.transpose(1, 2)  # (B, F+10, T)
-        h = self.tcn(x)  # (B, hidden, T)
-        h = h.transpose(1, 2)  # (B, T, hidden)
+        x = x.transpose(1, 2)
+        h = self.tcn(x)
+        h = h.transpose(1, 2)
         h = self.tcn_norm(h)
 
-        last = h[:, -1, :]  # (B, hidden)
-        pool = h.mean(dim=1)  # (B, hidden)
+        last = h[:, -1, :]
+        pool = h.mean(dim=1)
         fused = torch.cat([last, pool], dim=-1)
 
-        neural_out = self.head(fused)  # (B, 1)
-
-        # NEW: physical prior from GR4J raw discharge
-        q_mean = q_raw.mean(dim=1, keepdim=True)  # (B, 1)
-        q_prior = self.q_proj(q_mean)  # (B, 1)
-
-        return q_prior + neural_out
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# EMA
-# ═══════════════════════════════════════════════════════════════════════════════
+        return self.head(fused)
 
 
 class ModelEMA:
@@ -447,11 +441,6 @@ class _EMAContext:
 
     def __exit__(self, *args):
         self.model.load_state_dict(self.backup)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Metrics
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def safe_kge(obs, sim, eps=1e-8):
@@ -489,11 +478,6 @@ def log_nse(obs, sim, eps=1e-3):
     return 1 - np.sum((lo - ls) ** 2) / denom
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Plot helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 def light_style(ax):
     ax.set_facecolor("#ffffff")
     ax.tick_params(colors="#333333")
@@ -505,18 +489,17 @@ def light_style(ax):
     ax.grid(alpha=0.2, color="#cccccc")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════════════
+def set_gr4j_requires_grad(model, requires_grad: bool):
+    for p in model.gr4j.parameters():
+        p.requires_grad = requires_grad
 
 
 def main():
     cfg = get_config()
     set_seed(cfg.seed)
 
-    # Auto batch size: larger batches for shorter sequences (h=1/h=3)
     if cfg.batch_size is None:
-        cfg.batch_size = 512 if cfg.lookback <= 60 else 256
+        cfg.batch_size = 1024 if cfg.lookback <= 60 else 512
 
     tag = cfg.run_tag if cfg.run_tag else f"seed{cfg.seed}"
 
@@ -546,13 +529,12 @@ def main():
         print(
             f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB"
         )
-        # Speed: TF32 on Ampere/Ada (RTX 3050 Ti) — ~2× matmul speedup
         torch.set_float32_matmul_precision("high")
         print("  TF32 matmul precision enabled")
 
-    # ── Load sequences ─────────────────────────────────────────────────────────
     print("\nLoading sequences...")
-    suffix = f"_h{cfg.horizon}_lb{cfg.lookback}{cfg.seq_suffix}"
+    seq_suffix = getattr(cfg, "seq_suffix", "")
+    suffix = f"_h{cfg.horizon}_lb{cfg.lookback}{seq_suffix}"
     X_train = np.load(SEQ_DIR / f"X_train{suffix}.npy")
     y_train = np.load(SEQ_DIR / f"y_train{suffix}.npy")
     X_val = np.load(SEQ_DIR / f"X_val{suffix}.npy")
@@ -578,7 +560,6 @@ def main():
     input_dim = X_train.shape[2]
     seq_len = X_train.shape[1]
 
-    # ── Sanity check: P and PET must be raw mm/day ─────────────────────────────
     p_mean = float(X_train[:, :, cfg.precip_idx].mean())
     e_mean = float(X_train[:, :, cfg.pet_idx].mean())
     print(
@@ -587,16 +568,15 @@ def main():
     )
     if abs(p_mean) < 0.5 and np.std(X_train[:, :, cfg.precip_idx]) < 2.0:
         print(
-            "  ⚠️  WARNING: Precipitation looks normalized (mean≈0, std≈1). "
+            "  WARNING: Precipitation looks normalized (mean≈0, std≈1). "
             "GR4J needs raw mm/day. Use --seq_suffix '_hybrid'."
         )
     if abs(e_mean) < 0.5 and np.std(X_train[:, :, cfg.pet_idx]) < 2.0:
         print(
-            "  ⚠️  WARNING: PET looks normalized (mean≈0, std≈1). "
+            "  WARNING: PET looks normalized (mean≈0, std≈1). "
             "GR4J needs raw mm/day. Use --seq_suffix '_hybrid'."
         )
 
-    # ── Dataloaders ────────────────────────────────────────────────────────────
     train_ds = TensorDataset(
         torch.tensor(X_train, dtype=torch.float32),
         torch.tensor(y_train, dtype=torch.float32).unsqueeze(1),
@@ -638,7 +618,6 @@ def main():
         persistent_workers=persistent,
     )
 
-    # ── Model ──────────────────────────────────────────────────────────────────
     model = HybridGR4J_TCN(
         input_dim=input_dim,
         hidden_dim=cfg.hidden_dim,
@@ -649,31 +628,50 @@ def main():
         pet_idx=cfg.pet_idx,
     ).to(device)
 
-    # Speed: torch.compile graph optimization (PyTorch 2.0+)
-    if hasattr(torch, "compile"):
+    # JIT-script the GR4J extractor — the loop is static, so scripting can give
+    # a notable speedup on the t-loop without changing semantics. If it fails
+    # (e.g. unsupported op on this torch version), we fall back silently.
+    if cfg.jit_gr4j:
+        try:
+            model.gr4j = torch.jit.script(model.gr4j)
+            print("  GR4J extractor JIT-scripted")
+        except Exception as e:
+            print(f"  GR4J JIT-script skipped: {e}")
+
+    # torch.compile on the whole model — note that the GR4J Python loop may
+    # cause graph breaks; this is logged for diagnosis if needed.
+    if hasattr(torch, "compile") and sys.platform != "win32":
         try:
             model = torch.compile(model, mode="default")
-            print("  torch.compile enabled")
+            print("  torch.compile enabled (use TORCH_LOGS=graph_breaks to debug)")
         except Exception as e:
             print(f"  torch.compile skipped: {e}")
+    else:
+        print("  torch.compile skipped: Windows platform (Triton unavailable)")
 
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel parameters: {n_params:,} (trainable: {n_trainable:,})")
 
-    # Print GR4J initial parameters
+    # Resolve the underlying GR4J module robustly (after possible compile/script).
+    def _get_gr4j(m):
+        # torch.compile wraps with OptimizedModule that exposes ._orig_mod
+        base = getattr(m, "_orig_mod", m)
+        return base.gr4j
+
+    gr4j_mod = _get_gr4j(model)
+
     with torch.no_grad():
-        x1 = F.softplus(model.gr4j.X1) + 1.0
-        x2 = model.gr4j.X2.item()
-        x3 = F.softplus(model.gr4j.X3) + 1.0
-        x4 = (F.softplus(model.gr4j.X4) + 0.5).item()
+        x1 = F.softplus(gr4j_mod.X1) + 1.0
+        x2 = gr4j_mod.X2.item()
+        x3 = F.softplus(gr4j_mod.X3) + 1.0
+        x4 = (F.softplus(gr4j_mod.X4) + 0.5).item()
         sf = 1.0 - np.exp(-x4 / 0.956)
         print(
             f"  GR4J initial: X1={x1:.2f}mm, X2={x2:.4f}, X3={x3:.2f}mm, X4={x4:.2f}d"
         )
         print(f"  Routing store frac (X4={x4:.2f}): {sf:.3f}")
 
-    # ── Loss ───────────────────────────────────────────────────────────────────
     peak_threshold = float(np.percentile(y_train, cfg.peak_percentile))
     print(
         f"  Peak threshold (p{cfg.peak_percentile:.0f} of y_train): {peak_threshold:.4f}"
@@ -690,18 +688,28 @@ def main():
             peak_weight=cfg.peak_loss_weight,
         ).to(device)
     elif cfg.loss == "bias_huber":
-        print(f"  Loss: Huber(δ={cfg.huber_delta}) + bias penalty (w=0.5)")
+        print(f"  Loss: Huber(δ={cfg.huber_delta}) + EMA-smoothed bias penalty")
         criterion = BiasPenalizedHuber(
             huber_delta=cfg.huber_delta,
             bias_weight=0.5,
+            ema_decay=0.9,
         ).to(device)
     else:
-        print(f"  Loss: plain Huber (δ={cfg.huber_delta}) — peak weighting OFF")
+        print(f"  Loss: plain Huber (δ={cfg.huber_delta})")
         criterion = nn.SmoothL1Loss(beta=cfg.huber_delta).to(device)
 
-    # ── Optimizer (modest GR4J LR multiplier) ─────────────────────────────────
-    gr4j_params = list(model.gr4j.parameters())
-    other_params = [p for n, p in model.named_parameters() if not n.startswith("gr4j.")]
+    # Resolve GR4J params via the underlying module (handles compile/script wrapping).
+    gr4j_param_ids = {id(p) for p in gr4j_mod.parameters()}
+    gr4j_params = []
+    other_params = []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if id(p) in gr4j_param_ids:
+            gr4j_params.append(p)
+        else:
+            other_params.append(p)
+
     print(
         f"  GR4J params: {sum(p.numel() for p in gr4j_params)} "
         f"(lr × 10 = {cfg.lr * 10:.1e})"
@@ -719,7 +727,6 @@ def main():
         betas=(0.9, 0.999),
     )
 
-    # Linear warmup then ReduceLROnPlateau
     plateau = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -731,9 +738,15 @@ def main():
     scaler = GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
     ema = ModelEMA(model, decay=cfg.ema_decay)
 
-    # ── Training loop ──────────────────────────────────────────────────────────
+    # Optional two-stage training: freeze GR4J for an initial warm-start phase.
+    if cfg.freeze_gr4j_epochs > 0:
+        set_gr4j_requires_grad(_get_gr4j(model), False)
+        print(
+            f"  GR4J X1-X4 frozen for first {cfg.freeze_gr4j_epochs} epochs (warm-start)"
+        )
+
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"\n{'='*72}\nTraining run {run_id}\n{'='*72}")
+    print(f"\n{'=' * 72}\nTraining run {run_id}\n{'=' * 72}")
     print(
         f"  Arch: Hybrid GR4J-TCN | GR4J(P_idx={cfg.precip_idx},PET_idx={cfg.pet_idx}) → "
         f"TCN {cfg.hidden_dim}×{cfg.num_layers} + GAP"
@@ -744,6 +757,7 @@ def main():
     print(
         f"  LR: {cfg.lr} (warmup={cfg.warmup_epochs}, then ReduceLROnPlateau) | EMA: {cfg.ema_decay}"
     )
+    print(f"  X2 clamp: [{cfg.x2_min}, {cfg.x2_max}] (allows groundwater loss)")
     print(f"  Input: {seq_len}-day lookback × {input_dim} raw + 10 GR4J features\n")
 
     history = {
@@ -759,13 +773,16 @@ def main():
     start = time.time()
 
     for epoch in range(1, cfg.epochs + 1):
-        # Warmup
+        # Unfreeze GR4J after warm-start phase
+        if cfg.freeze_gr4j_epochs > 0 and epoch == cfg.freeze_gr4j_epochs + 1:
+            set_gr4j_requires_grad(_get_gr4j(model), True)
+            print(f"  Epoch {epoch}: GR4J X1-X4 unfrozen, joint training resumes")
+
         if epoch <= cfg.warmup_epochs:
             lr_scale = epoch / cfg.warmup_epochs
             optimizer.param_groups[0]["lr"] = cfg.lr * 10 * lr_scale
             optimizer.param_groups[1]["lr"] = cfg.lr * lr_scale
 
-        # ── Train ──────────────────────────────────────────────────────────────
         model.train()
         train_loss_sum = 0.0
         train_n = 0
@@ -785,9 +802,9 @@ def main():
             scaler.step(optimizer)
             scaler.update()
 
-            # NEW: Clamp X2 to physical range (karst springs are gaining)
             with torch.no_grad():
-                model.gr4j.X2.clamp_(min=0.0, max=5.0)
+                # Allow X2 in [x2_min, x2_max] — negative = groundwater loss
+                _get_gr4j(model).X2.clamp_(min=cfg.x2_min, max=cfg.x2_max)
 
             ema.update(model)
 
@@ -797,7 +814,6 @@ def main():
 
         train_loss = train_loss_sum / max(train_n, 1)
 
-        # ── Validate (EMA weights) ─────────────────────────────────────────────
         model.eval()
         with ema.apply_to(model):
             val_loss_sum = 0.0
@@ -817,24 +833,21 @@ def main():
         val_loss = val_loss_sum / max(val_n, 1)
         val_mae = val_mae_sum / max(val_n, 1)
 
-        # LR scheduling after warmup
         if epoch > cfg.warmup_epochs:
             plateau.step(val_loss)
 
-        current_lr = optimizer.param_groups[1]["lr"]  # backbone LR
+        current_lr = optimizer.param_groups[1]["lr"]
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_mae_ema"].append(val_mae)
         history["lr"].append(current_lr)
 
-        # ── Checkpointing & early stopping ─────────────────────────────────────
         if val_loss < best_val:
             best_val = val_loss
             best_epoch = epoch
             patience_counter = 0
 
-            # Save best EMA weights
             ckpt_path = MODEL_DIR / "checkpoints" / f"gr4j_tcn_best_{tag}.pt"
             torch.save(
                 {
@@ -862,10 +875,7 @@ def main():
     elapsed = time.time() - start
     print(f"\nTraining finished in {elapsed/60:.1f} min ({elapsed:.0f} s)")
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # Test evaluation (best EMA model)
-    # ═══════════════════════════════════════════════════════════════════════════════
-    print(f"\n{'='*72}\nTest evaluation (best EMA epoch {best_epoch})\n{'='*72}")
+    print(f"\n{'=' * 72}\nTest evaluation (best EMA epoch {best_epoch})\n{'=' * 72}")
 
     with ema.apply_to(model):
         model.eval()
@@ -882,15 +892,12 @@ def main():
     pred_norm = np.concatenate(all_pred, axis=0).flatten()
     true_norm = np.concatenate(all_true, axis=0).flatten()
 
-    # ── Denormalise (and invert log-transform if it was applied in windowing.py) ──
-    suffix = f"_h{cfg.horizon}_lb{cfg.lookback}{cfg.seq_suffix}"
     scaler_path = ROOT / "data" / "splits" / f"scaler_params{suffix}.csv"
     scaler_df = pd.read_csv(scaler_path, index_col=0)
     q_min = float(scaler_df.loc["__target__", "min"])
     q_max = float(scaler_df.loc["__target__", "max"])
 
-    # Detect log transform from windowing metadata if present
-    meta_path = ROOT / "data" / "splits" / f"window_meta{suffix}.json"
+    meta_path = ROOT / "data" / "sequences" / f"window_meta{suffix}.json"
     log_transformed = False
     log_eps = 1e-3
     if meta_path.exists():
@@ -899,21 +906,15 @@ def main():
         log_transformed = meta.get("log_transform", False)
         log_eps = meta.get("log_eps", 1e-3)
 
-    # Invert min-max
     pred_raw = pred_norm * (q_max - q_min) + q_min
     true_raw = true_norm * (q_max - q_min) + q_min
 
-    # Invert log1p if needed
     if log_transformed:
         pred_raw = np.expm1(pred_raw) - log_eps
         true_raw = np.expm1(true_raw) - log_eps
-        # Clamp negatives from numerical noise
         pred_raw = np.maximum(pred_raw, 0.0)
         true_raw = np.maximum(true_raw, 0.0)
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # Metrics
-    # ═══════════════════════════════════════════════════════════════════════════════
     def pbias(obs, sim):
         return 100.0 * np.sum(sim - obs) / np.sum(obs)
 
@@ -931,16 +932,18 @@ def main():
     r2_val = r2_score(true_raw, pred_raw)
     pbias_val = pbias(true_raw, pred_raw)
     peak_bias_val = peak_bias(true_raw, pred_raw, percentile=95)
+    log_nse_val = log_nse(true_raw, pred_raw)
 
-    print(f"  NSE   : {nse_val:.4f}")
+    print(f"  NSE     : {nse_val:.4f}")
+    print(f"  logNSE  : {log_nse_val:.4f}")
     print(
-        f"  KGE   : {kge_val:.4f}  (r={r_val:.4f}, α={alpha_val:.4f}, β={beta_val:.4f})"
+        f"  KGE     : {kge_val:.4f}  (r={r_val:.4f}, α={alpha_val:.4f}, β={beta_val:.4f})"
     )
-    print(f"  MAE   : {mae_val:.4f} m³/s")
-    print(f"  RMSE  : {rmse_val:.4f} m³/s")
-    print(f"  R²    : {r2_val:.4f}")
-    print(f"  PBIAS : {pbias_val:+.2f} %")
-    print(f"  Peak% : {peak_bias_val:+.2f} %")
+    print(f"  MAE     : {mae_val:.4f} m³/s")
+    print(f"  RMSE    : {rmse_val:.4f} m³/s")
+    print(f"  R²      : {r2_val:.4f}")
+    print(f"  PBIAS   : {pbias_val:+.2f} %")
+    print(f"  Peak%   : {peak_bias_val:+.2f} %")
 
     metrics = {
         "model": "GR4J-TCN",
@@ -949,6 +952,7 @@ def main():
         "lookback": cfg.lookback,
         "seed": cfg.seed,
         "nse": float(nse_val),
+        "log_nse": float(log_nse_val),
         "kge": float(kge_val),
         "r": float(r_val),
         "alpha": float(alpha_val),
@@ -974,13 +978,11 @@ def main():
         "q_max": q_max,
     }
 
-    # Save metrics
     met_path = MET_DIR / f"metrics_gr4j_tcn_{tag}.json"
     with open(met_path, "w") as f:
         json.dump(metrics, f, indent=2)
     print(f"\nMetrics saved → {met_path}")
 
-    # Save predictions
     pred_df = pd.DataFrame(
         {
             "date": pd.to_datetime(dates_test),
@@ -993,7 +995,6 @@ def main():
     pred_df.to_csv(pred_path, index=False)
     print(f"Predictions saved → {pred_path}")
 
-    # Save final model (non-EMA, for inspection)
     final_path = MODEL_DIR / "trained" / f"gr4j_tcn_final_{tag}.pt"
     torch.save(
         {
@@ -1005,93 +1006,29 @@ def main():
         final_path,
     )
 
-    # Save config
     cfg_path = MODEL_DIR / "configs" / f"gr4j_tcn_config_{tag}.json"
     with open(cfg_path, "w") as f:
         json.dump(vars(cfg), f, indent=2)
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # Training history plot
-    # ═══════════════════════════════════════════════════════════════════════════════
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=150)
-    fig.patch.set_facecolor("#ffffff")
-
-    # Loss curves
-    ax = axes[0, 0]
-    ax.plot(
-        history["epoch"], history["train_loss"], label="Train", color="#1f77b4", lw=1.2
-    )
-    ax.plot(history["epoch"], history["val_loss"], label="Val", color="#ff7f0e", lw=1.2)
-    ax.axvline(
-        best_epoch, color="#2ca02c", ls="--", alpha=0.7, label=f"Best ({best_epoch})"
-    )
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
-    ax.set_title("Loss Curves")
-    ax.legend()
-    light_style(ax)
-
-    # LR schedule
-    ax = axes[0, 1]
-    ax.plot(history["epoch"], history["lr"], color="#9467bd", lw=1.2)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Learning Rate")
-    ax.set_title("LR Schedule")
-    ax.set_yscale("log")
-    light_style(ax)
-
-    # Observed vs Predicted scatter
-    ax = axes[1, 0]
-    ax.scatter(true_raw, pred_raw, alpha=0.25, s=8, c="#1f77b4", edgecolors="none")
-    lim = [min(true_raw.min(), pred_raw.min()), max(true_raw.max(), pred_raw.max())]
-    ax.plot(lim, lim, "k--", lw=1, alpha=0.5)
-    ax.set_xlabel("Observed (m³/s)")
-    ax.set_ylabel("Predicted (m³/s)")
-    ax.set_title(f"Scatter  |  NSE={nse_val:.3f}  KGE={kge_val:.3f}")
-    light_style(ax)
-
-    # Time series (last 365 days of test)
-    ax = axes[1, 1]
-    plot_len = min(365, len(true_raw))
-    dates_plot = pd.to_datetime(dates_test[-plot_len:])
-    ax.plot(dates_plot, true_raw[-plot_len:], label="Observed", color="#1f77b4", lw=1.2)
-    ax.plot(
-        dates_plot, pred_raw[-plot_len:], label="Predicted", color="#ff7f0e", lw=1.2
-    )
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Discharge (m³/s)")
-    ax.set_title(f"Test Period (last {plot_len} days)")
-    ax.legend()
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
-    light_style(ax)
-
-    fig.tight_layout()
-    fig_path = FIG_DIR / f"gr4j_tcn_{tag}.png"
-    fig.savefig(fig_path, dpi=150, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    print(f"Figure saved → {fig_path}")
-
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # GR4J learned parameters report
-    # ═══════════════════════════════════════════════════════════════════════════════
     with torch.no_grad():
-        x1 = F.softplus(model.gr4j.X1) + 1.0
-        x2 = model.gr4j.X2.item()
-        x3 = F.softplus(model.gr4j.X3) + 1.0
-        x4 = (F.softplus(model.gr4j.X4) + 0.5).item()
+        gr4j_mod = _get_gr4j(model)
+        x1 = F.softplus(gr4j_mod.X1) + 1.0
+        x2 = gr4j_mod.X2.item()
+        x3 = F.softplus(gr4j_mod.X3) + 1.0
+        x4 = (F.softplus(gr4j_mod.X4) + 0.5).item()
         sf = 1.0 - np.exp(-x4 / 0.956)
 
-    print(f"\n{'='*72}")
+    print(f"\n{'=' * 72}")
     print("Learned GR4J parameters")
-    print(f"{'='*72}")
+    print(f"{'=' * 72}")
     print(f"  X1 (production capacity) : {x1:.2f} mm")
-    print(f"  X2 (groundwater exchange) : {x2:.4f} mm/day  (clamped ≥ 0)")
+    print(
+        f"  X2 (groundwater exchange) : {x2:+.4f} mm/day  (clamped to [{cfg.x2_min}, {cfg.x2_max}])"
+    )
     print(f"  X3 (routing capacity)    : {x3:.2f} mm")
     print(f"  X4 (time constant)       : {x4:.2f} days")
     print(f"  Routing store fraction   : {sf:.3f}")
-    print(f"{'='*72}\n")
+    print(f"{'=' * 72}\n")
 
 
 if __name__ == "__main__":

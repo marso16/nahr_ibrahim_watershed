@@ -1,16 +1,3 @@
-"""
-collect_metrics.py — Scan results/metrics/ and summarize all trained models.
-
-Detects model type from filename prefix, collects NSE, KGE, MAE, RMSE,
-PBIAS, Peak_Bias, Log_NSE, and prints a sorted summary table.
-
-Usage:
-    python collect_metrics.py
-    python collect_metrics.py --sort nse
-    python collect_metrics.py --horizon 1
-    python collect_metrics.py --csv results/all_metrics.csv
-"""
-
 import os
 import argparse
 import pandas as pd
@@ -49,16 +36,12 @@ def get_args():
 
 
 def detect_model(filename: str) -> str:
-    """Infer model name from metrics CSV filename."""
     fn = filename.lower()
-    if "bilstm" in fn:
-        return "BiLSTM"
+
     if "gr4j" in fn:
         return "GR4J"
     if "hybrid" in fn:
         return "Hybrid"
-    if "ulstm" in fn:
-        return "UniLSTM"
     if "lstm" in fn:
         return "LSTM"
     if "tcn" in fn:
@@ -94,7 +77,6 @@ def main():
         print("Run your models first to generate metrics CSVs.")
         return
 
-    # Collect all CSV files
     files = sorted(MET_DIR.glob("*.csv"))
     if not files:
         print(f"No metrics CSVs found in {MET_DIR}")
@@ -109,8 +91,6 @@ def main():
         try:
             df = pd.read_csv(fpath)
 
-            # Some files may have multiple rows (train/val/test splits)
-            # Keep only Test split if available, otherwise first row
             if "split" in df.columns:
                 test_rows = df[df["split"].str.lower() == "test"]
                 row = test_rows.iloc[0] if len(test_rows) > 0 else df.iloc[0]
@@ -141,14 +121,12 @@ def main():
 
     result = pd.DataFrame(rows)
 
-    # Filter by horizon if requested
     if args.horizon is not None:
         result = result[result["Horizon"] == args.horizon]
         if result.empty:
             print(f"No results found for horizon={args.horizon}")
             return
 
-    # Sort
     sort_map = {
         "nse": ("NSE", False),
         "kge": ("KGE", False),
@@ -160,7 +138,6 @@ def main():
     sort_col, ascending = sort_map[args.sort]
     result = result.sort_values(sort_col, ascending=ascending).reset_index(drop=True)
 
-    # ── Print summary ────────────────────────────────────────────────────────
     print(f"{'='*110}")
     print(
         f"{'Model':<14} {'H':>2} {'Seed':>6}  {'NSE':>7} {'KGE':>7} "
@@ -172,7 +149,6 @@ def main():
         horizon = f"{r['Horizon']}" if r["Horizon"] != "?" else "?"
         seed = f"{r['Seed']}" if r["Seed"] != "?" else "?"
 
-        # Flag bad results
         nse_str = f"{r['NSE']:>7.4f}"
         flag = ""
         if r["NSE"] < 0:
@@ -191,7 +167,6 @@ def main():
     print(f"{'='*110}")
     print(f"Total: {len(result)} result(s)")
 
-    # ── Per-model summary (mean ± std across seeds) ───────────────────────────
     multi_seed = result.groupby(["Model", "Horizon"]).filter(lambda x: len(x) > 1)
     if not multi_seed.empty:
         print(f"\n{'─'*70}")
@@ -215,7 +190,6 @@ def main():
             )
         print(f"{'─'*70}")
 
-    # ── Best per model (across seeds) ─────────────────────────────────────────
     print(f"\n{'─'*70}")
     print("Best result per model (by NSE):")
     print(f"{'─'*70}")
@@ -228,13 +202,11 @@ def main():
         )
     print(f"{'─'*70}")
 
-    # ── Skipped files ─────────────────────────────────────────────────────────
     if skipped:
         print(f"\nSkipped {len(skipped)} file(s) due to errors:")
         for fname, err in skipped:
             print(f"  {fname}: {err}")
 
-    # ── Save CSV ───────────────────────────────────────────────────────────────
     if args.csv:
         out = Path(args.csv)
         out.parent.mkdir(parents=True, exist_ok=True)

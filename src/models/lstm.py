@@ -703,8 +703,12 @@ def main():
     suffix = f"_h{cfg.horizon}_lb{cfg.lookback}{getattr(cfg, 'seq_suffix', '')}"
     scaler_path = ROOT / "data" / "splits" / f"scaler_params{suffix}.csv"
     scaler_df = pd.read_csv(scaler_path, index_col=0)
-    q_min = float(scaler_df.loc["__target__", "min"])
-    q_max = float(scaler_df.loc["__target__", "max"])
+    if "__target__" in scaler_df.index:
+        q_min = float(scaler_df.loc["__target__", "min"])
+        q_max = float(scaler_df.loc["__target__", "max"])
+    else:
+        q_min = float(scaler_df.loc["discharge_m3s", "min"])
+        q_max = float(scaler_df.loc["discharge_m3s", "max"])
 
     if "__meta__" in scaler_df.index:
         log_transform = bool(float(scaler_df.loc["__meta__", "min"]))

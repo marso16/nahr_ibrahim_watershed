@@ -3,7 +3,6 @@ import json
 import time
 import random
 import argparse
-import logging
 import numpy as np
 import pandas as pd
 import torch
@@ -18,10 +17,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import matplotlib.dates as mdates
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-from scipy import stats
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -74,12 +71,6 @@ def get_config():
     p.add_argument(
         "--tcn_levels", type=int, default=None, help="Deprecated alias for --num_layers"
     )
-    # p.add_argument(
-    #     "--tcn_base_channels", type=int, default=128, help="Channels per TCN level"
-    # )
-    # p.add_argument(
-    #     "--tcn_levels", type=int, default=3, help="Number of dilated TCN blocks"
-    # )
     p.add_argument("--kernel_size", type=int, default=3, help="TCN kernel size")
     p.add_argument("--attention_dim", type=int, default=128)
     p.add_argument("--attention_heads", type=int, default=4)
@@ -111,6 +102,12 @@ def get_config():
         default=None,
         help="Optional tag appended to all output filenames. "
         "If omitted, defaults to 'seed{seed}'.",
+    )
+    p.add_argument(
+        "--seq_suffix",
+        type=str,
+        default="",
+        help="Extra suffix on sequence files, e.g. '_hybrid'",
     )
     return p.parse_args()
 
@@ -243,17 +240,6 @@ class AdditiveAttention(nn.Module):
         return self.dropout(context), weights.squeeze(-1)
 
 
-# class WatershedTCN(nn.Module):
-#     def __init__(
-#         self,
-#         input_dim: int,
-#         tcn_channels: list,
-#         kernel_size: int = 3,
-#         attention_dim: int = 128,
-#         attention_heads: int = 4,
-#         dropout: float = 0.20,
-#     ):
-#         super().__init__()
 class WatershedTCN(nn.Module):
     def __init__(
         self,
@@ -283,15 +269,6 @@ class WatershedTCN(nn.Module):
         self.attention = AdditiveAttention(
             out_channels, attention_dim, dropout=dropout / 2
         )
-
-        # Multi-head self-attention over TCN outputs
-        # self.mha = nn.MultiheadAttention(
-        #     out_channels,
-        #     num_heads=attention_heads,
-        #     dropout=dropout / 2,
-        #     batch_first=True,
-        # )
-        # self.mha_norm = nn.LayerNorm(out_channels)
 
         # Residual projection from last input timestep
         self.input_residual = nn.Sequential(
@@ -331,8 +308,6 @@ class WatershedTCN(nn.Module):
         h = self.tcn(x)  # (B, C, T)
         h = h.transpose(1, 2)  # (B, T, C)
 
-        # mha_out, _ = self.mha(h, h, h)
-        # mha_out = self.mha_norm(h + mha_out)
         mha_pool = h.mean(dim=1)
 
         # Additive attention on h
@@ -433,7 +408,7 @@ def safe_kge(obs, sim, eps=1e-8):
     obs = np.asarray(obs, dtype=np.float64)
     sim = np.asarray(sim, dtype=np.float64)
 
-    obs_std, sim_std = obs.std(), sim.std()
+    obs_std, sim_std = obs.std(), obs.std()
     obs_mean = obs.mean()
 
     if obs_std < eps or sim_std < eps or abs(obs_mean) < eps:
@@ -527,7 +502,8 @@ def main():
 
     # ── Load sequences ────────────────────────────────────────────────────────
     print("\nLoading sequences...")
-    suffix = f"_h{cfg.horizon}_lb{cfg.lookback}"
+    seq_suffix = getattr(cfg, "seq_suffix", "")
+    suffix = f"_h{cfg.horizon}_lb{cfg.lookback}{seq_suffix}"
     X_train = np.load(SEQ_DIR / f"X_train{suffix}.npy")
     y_train = np.load(SEQ_DIR / f"y_train{suffix}.npy")
     X_val = np.load(SEQ_DIR / f"X_val{suffix}.npy")
@@ -597,16 +573,6 @@ def main():
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    # tcn_channels = [cfg.tcn_base_channels] * cfg.tcn_levels
-    # model = WatershedTCN(
-    #     input_dim=input_dim,
-    #     tcn_channels=tcn_channels,
-    #     kernel_size=cfg.kernel_size,
-    #     attention_dim=cfg.attention_dim,
-    #     attention_heads=cfg.attention_heads,
-    #     dropout=cfg.dropout,
-    # ).to(device)
-
     tcn_channels = [cfg.hidden_dim] * cfg.num_layers
     model = WatershedTCN(
         input_dim=input_dim,
@@ -647,10 +613,6 @@ def main():
         optimizer, mode="min", factor=0.5, patience=50, min_lr=1e-6
     )
 
-    # plateau = optim.lr_scheduler.ReduceLROnPlateau(
-    #     optimizer, mode="min", factor=0.5, patience=50, min_lr=1e-6
-    # )
-
     scaler = GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
     ema = ModelEMA(model, decay=cfg.ema_decay)
 
@@ -671,6 +633,8 @@ def main():
             f"  Loss: Huber(δ={cfg.huber_delta}) with peak weight={cfg.peak_loss_weight}× "
             f"above p{cfg.peak_percentile:.0f}"
         )
+    elif cfg.use_nse_loss:
+        print(f"  Loss: NSE-loss (batch-wise)")
     else:
         print(f"  Loss: plain Huber(δ={cfg.huber_delta}) — peak weighting OFF")
     print(f"  Input: {seq_len}-day lookback × {input_dim} features\n")
@@ -812,18 +776,28 @@ def main():
     y_pred = np.concatenate(y_pred_list).flatten()
 
     # Denormalise (and invert log-transform if it was applied in windowing.py)
-    suffix = f"_h{cfg.horizon}_lb{cfg.lookback}{getattr(cfg, 'seq_suffix', '')}"
     scaler_path = ROOT / "data" / "splits" / f"scaler_params{suffix}.csv"
     scaler_df = pd.read_csv(scaler_path, index_col=0)
-    q_min = float(scaler_df.loc["__target__", "min"])
-    q_max = float(scaler_df.loc["__target__", "max"])
 
-    if "__meta__" in scaler_df.index:
+    if "__target__" in scaler_df.index:
+        q_min = float(scaler_df.loc["__target__", "min"])
+        q_max = float(scaler_df.loc["__target__", "max"])
+    else:
+        q_min = float(scaler_df.loc["discharge_m3s", "min"])
+        q_max = float(scaler_df.loc["discharge_m3s", "max"])
+
+    # Read log-transform metadata from window_meta.json (new format) or CSV __meta__ (old format)
+    meta_path = ROOT / "data" / "splits" / f"window_meta{suffix}.json"
+    log_transform = False
+    log_eps = 0.0
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = json.load(f)
+        log_transform = meta.get("log_transform", False)
+        log_eps = meta.get("log_eps", 0.0)
+    elif "__meta__" in scaler_df.index:
         log_transform = bool(float(scaler_df.loc["__meta__", "min"]))
         log_eps = float(scaler_df.loc["__meta__", "max"])
-    else:
-        log_transform = False
-        log_eps = 0.0
 
     y_test_lin = y_test * (q_max - q_min) + q_min
     y_pred_lin = y_pred * (q_max - q_min) + q_min
@@ -930,313 +904,6 @@ def main():
     }
     with open(LOG_DIR / f"hparams_tcn_{run_id}.json", "w") as f:
         json.dump(hparams, f, indent=2)
-
-    # ── Individual plots ──────────────────────────────────────────────────────
-
-    def save_fig(fig, name):
-        fig.tight_layout()
-        fig.savefig(
-            FIG_DIR / f"{name}_{tag}.png",
-            dpi=300,
-            bbox_inches="tight",
-            facecolor="#ffffff",
-        )
-        plt.close(fig)
-
-    # ==========================================================================
-    # 1. Time series
-    # ==========================================================================
-    fig, ax = plt.subplots(figsize=(14, 6))
-    light_style(ax)
-
-    ax.plot(
-        pred_df["date"],
-        pred_df["observed"],
-        color="#1f77b4",
-        lw=1.2,
-        label="Observed",
-    )
-
-    ax.plot(
-        pred_df["date"],
-        pred_df["predicted"],
-        color="#ff7f0e",
-        lw=1.2,
-        alpha=0.85,
-        label="Predicted",
-    )
-
-    ax.scatter(
-        pred_df.loc[peak_mask, "date"],
-        pred_df.loc[peak_mask, "observed"],
-        color="#d62728",
-        s=15,
-        alpha=0.7,
-        label="Peaks (p95)",
-    )
-
-    ax.fill_between(
-        pred_df["date"],
-        pred_df["observed"],
-        alpha=0.08,
-        color="#1f77b4",
-    )
-
-    ax.set_ylabel("Discharge (m³/s)")
-    ax.set_title(
-        f"Forecast — R²={r2:.3f} | NSE={nse_val:.3f} | "
-        f"KGE={kge_val:.3f} | MAE={mae_real:.2f}"
-    )
-
-    ax.legend()
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
-
-    save_fig(fig, "timeseries")
-
-    # ==========================================================================
-    # 2. Observed vs Predicted Scatter
-    # ==========================================================================
-    fig, ax = plt.subplots(figsize=(7, 6))
-    light_style(ax)
-
-    ax.scatter(
-        pred_df["observed"],
-        pred_df["predicted"],
-        alpha=0.35,
-        s=12,
-        color="#9467bd",
-    )
-
-    ax.scatter(
-        pred_df.loc[peak_mask, "observed"],
-        pred_df.loc[peak_mask, "predicted"],
-        alpha=0.6,
-        s=20,
-        color="#d62728",
-        label="Peaks",
-    )
-
-    lims = [
-        min(pred_df["observed"].min(), pred_df["predicted"].min()),
-        max(pred_df["observed"].max(), pred_df["predicted"].max()),
-    ]
-
-    ax.plot(lims, lims, "--", color="#888888", label="1:1")
-
-    ax.set_xlabel("Observed (m³/s)")
-    ax.set_ylabel("Predicted (m³/s)")
-    ax.set_title("Observed vs Predicted")
-    ax.legend()
-
-    save_fig(fig, "scatter")
-
-    # ==========================================================================
-    # 3. Residual Time Series
-    # ==========================================================================
-    # fig, ax = plt.subplots(figsize=(14, 5))
-    # light_style(ax)
-
-    # ax.axhline(0, color="#888888", lw=1)
-
-    # ax.plot(
-    #     pred_df["date"],
-    #     pred_df["residual"],
-    #     color="#d62728",
-    #     lw=0.8,
-    # )
-
-    # ax.fill_between(
-    #     pred_df["date"],
-    #     pred_df["residual"],
-    #     0,
-    #     alpha=0.15,
-    #     color="#d62728",
-    # )
-
-    # ax.set_ylabel("Residual (m³/s)")
-    # ax.set_title("Residuals")
-
-    # save_fig(fig, "residual_timeseries")
-
-    # ==========================================================================
-    # 4. Residual Histogram
-    # ==========================================================================
-    # fig, ax = plt.subplots(figsize=(8, 6))
-    # light_style(ax)
-
-    # ax.hist(
-    #     pred_df["residual"],
-    #     bins=60,
-    #     density=True,
-    #     alpha=0.7,
-    #     color="#2ca02c",
-    # )
-
-    # ax.hist(
-    #     pred_df.loc[peak_mask, "residual"],
-    #     bins=30,
-    #     density=True,
-    #     alpha=0.5,
-    #     color="#d62728",
-    #     label="Peak residuals",
-    # )
-
-    # ax.axvline(0, color="#888888", ls="--")
-
-    # ax.set_xlabel("Residual (m³/s)")
-    # ax.set_ylabel("Density")
-    # ax.set_title("Residual Distribution")
-    # ax.legend()
-
-    # save_fig(fig, "residual_histogram")
-
-    # ==========================================================================
-    # 5. Peak Scatter
-    # ==========================================================================
-    fig, ax = plt.subplots(figsize=(7, 6))
-    light_style(ax)
-
-    pdf_peak = pred_df[peak_mask]
-
-    if len(pdf_peak) > 0:
-        ax.scatter(
-            pdf_peak["observed"],
-            pdf_peak["predicted"],
-            alpha=0.6,
-            s=25,
-            color="#d62728",
-        )
-
-        plims = [
-            pdf_peak["observed"].min() * 0.9,
-            pdf_peak["observed"].max() * 1.05,
-        ]
-
-        ax.plot(plims, plims, "--", color="#888888")
-
-    ax.set_xlabel("Observed (m³/s)")
-    ax.set_ylabel("Predicted (m³/s)")
-    ax.set_title(f"Peak Flows (p95)\nBias={peak_bias:+.1f}% | MAE={peak_mae:.2f}")
-
-    save_fig(fig, "peak_scatter")
-
-    # ==========================================================================
-    # 6. Q-Q Plot
-    # ==========================================================================
-    # fig, ax = plt.subplots(figsize=(7, 6))
-    # light_style(ax)
-
-    # stats.probplot(
-    #     pred_df["residual"],
-    #     dist="norm",
-    #     plot=ax,
-    # )
-
-    # ax.set_title("Residual Q-Q Plot")
-
-    # save_fig(fig, "qq_plot")
-
-    # ==========================================================================
-    # 7. Flow Duration Curve
-    # ==========================================================================
-    fig, ax = plt.subplots(figsize=(8, 6))
-    light_style(ax)
-
-    obs_s = np.sort(pred_df["observed"].values)[::-1]
-    sim_s = np.sort(pred_df["predicted"].values)[::-1]
-
-    exc_o = np.arange(1, len(obs_s) + 1) / len(obs_s) * 100
-    exc_s = np.arange(1, len(sim_s) + 1) / len(sim_s) * 100
-
-    ax.semilogy(
-        exc_o,
-        np.maximum(obs_s, 1e-3),
-        label="Observed",
-    )
-
-    ax.semilogy(
-        exc_s,
-        np.maximum(sim_s, 1e-3),
-        label="Predicted",
-    )
-
-    ax.set_xlabel("Exceedance Probability (%)")
-    ax.set_ylabel("Discharge (m³/s)")
-    ax.set_title("Flow Duration Curve")
-    ax.legend()
-
-    save_fig(fig, "flow_duration_curve")
-
-    # ==========================================================================
-    # 8. Training History
-    # ==========================================================================
-    fig, ax = plt.subplots(figsize=(10, 6))
-    light_style(ax)
-
-    ax.plot(
-        history_df["epoch"],
-        history_df["train_loss"],
-        label="Train loss",
-    )
-
-    ax.plot(
-        history_df["epoch"],
-        history_df["val_loss"],
-        label="Val loss",
-    )
-
-    ax.plot(
-        history_df["epoch"],
-        history_df["val_mae_ema"],
-        label="Val MAE",
-    )
-
-    ax.axvline(
-        best_epoch,
-        linestyle="--",
-        label=f"Best epoch ({best_epoch})",
-    )
-
-    ax.set_yscale("log")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss / MAE")
-    ax.set_title("Training History")
-    ax.legend()
-
-    save_fig(fig, "training_history")
-
-    # ==========================================================================
-    # 9. Metrics Figure
-    # ==========================================================================
-    # fig, ax = plt.subplots(figsize=(6, 6))
-    # ax.axis("off")
-
-    # metrics_text = (
-    #     f"R²      : {r2:.4f}\n"
-    #     f"NSE     : {nse_val:.4f}\n"
-    #     f"KGE     : {kge_val:.4f}\n"
-    #     f"logNSE  : {log_nse_val:.4f}\n\n"
-    #     f"MAE     : {mae_real:.3f}\n"
-    #     f"RMSE    : {rmse_real:.3f}\n"
-    #     f"PBIAS   : {pbias:+.2f}%\n\n"
-    #     f"Peak Bias : {peak_bias:+.2f}%\n"
-    #     f"Peak MAE  : {peak_mae:.3f}\n"
-    #     f"Peak RMSE : {peak_rmse:.3f}"
-    # )
-
-    # ax.text(
-    #     0.05,
-    #     0.95,
-    #     metrics_text,
-    #     va="top",
-    #     fontsize=11,
-    #     fontfamily="monospace",
-    # )
-
-    # save_fig(fig, "metrics")
-
-    print(f"\nSaved individual figures to: {FIG_DIR}")
 
     print(f"\n{'=' * 72}")
     print(f"TARGET CHECK:  NSE={nse_val:.3f}  |  " f"KGE={kge_val:.3f}")
